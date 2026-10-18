@@ -164,6 +164,7 @@ public final class PadBridge {
     }
 
     public static boolean isControllerKeyEvent(KeyEvent event) {
+        if (DualSenseBridge.isBridged(event)) return false;
         InputDevice device = event.getDevice();
         if (device == null || device.isVirtual()) return false;
         if (KeyEvent.isGamepadButton(event.getKeyCode())) {
@@ -188,6 +189,7 @@ public final class PadBridge {
     }
 
     public static boolean isControllerMotionEvent(MotionEvent event) {
+        if (DualSenseBridge.isBridged(event)) return false;
         InputDevice device = event.getDevice();
         return event.isFromSource(InputDevice.SOURCE_JOYSTICK) && device != null && !device.isVirtual()
                 && (device.supportsSource(InputDevice.SOURCE_GAMEPAD)
