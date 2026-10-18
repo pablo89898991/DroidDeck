@@ -45,6 +45,10 @@ object DualSenseBridge {
     private val GYRO_SIGN = floatArrayOf(1f, 1f, 1f) // flip an entry to -1f if an axis feels inverted
     private val ACCEL_SIGN = floatArrayOf(1f, 1f, 1f)
     private const val GYRO_GAIN = 1f                 // multiplies gyro only; raise if motion is too slow
+    // Touchpad orientation on the DroidDeck side (the bridge app has the same settings; use one or the other, not both).
+    private const val TOUCH_INV_X = true
+    private const val TOUCH_INV_Y = true
+    private const val TOUCH_SWAP = false
     private const val MAP_TOUCHPAD = true            // left half = left trackpad, right half = right trackpad
     private const val TOUCH_HALF = 960               // DualSense touchpad is 1920 x 1080
     private const val TOUCH_H = 1079f
@@ -235,7 +239,13 @@ object DualSenseBridge {
         val key = if (touching) (((p[1] * 127f).toInt() and 0xFF) shl 8) or ((p[2] * 127f).toInt() and 0xFF) else -1
         if (key == lastTouchKey[slot]) return
         lastTouchKey[slot] = key
-        if (touching) DeckControls.setPad(right, true, p[1], p[2]) else DeckControls.setPad(right, false)
+        if (touching) {
+            var x = p[1]; var y = p[2]
+            if (TOUCH_SWAP) { val t = x; x = y; y = t }
+            if (TOUCH_INV_X) x = -x
+            if (TOUCH_INV_Y) y = -y
+            DeckControls.setPad(right, true, x, y)
+        } else DeckControls.setPad(right, false)
     }
 
     /** Bit 0 = a finger on the left half, bit 1 = a finger on the right half. */
