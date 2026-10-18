@@ -12,14 +12,17 @@ import android.os.Message
 import android.os.Messenger
 import android.os.RemoteException
 import android.os.SystemClock
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
 
 /**
- * Receives DualSense / DualSense Edge input from the companion "DualSense Edge Bridge" app
+ * Receives controller input (DualSense / Edge with full features, any other SDL3-supported pad) from the companion SDL3 bridge app
  * and feeds it into DroidDeck's pad pipeline.
  *
  *  sticks / triggers / D-pad / face + shoulder buttons -> PadBridge.applyExternal
  *  Edge paddles (L/R)  -> Deck grips L4 / R4;  Edge Fn (L/R) -> L5 / R5
- *  touchpad            -> left half = left Deck trackpad, right half = right trackpad (+ click)
+ *  touchpad            -> decoupled by the bridge: left half = left Deck trackpad, right half = right trackpad (+ click)
  *  gyro / accel        -> FakeInputWriter.writeMotion (slot 0)
  *
  * Usage:  DualSenseBridge.attach(context, padBridge)  when the session starts,
@@ -69,6 +72,8 @@ object DualSenseBridge {
     private val lastAxes = FloatArray(6)
     private var lastApplyMs = 0L
     @Volatile private var lastFrameMs = 0L
+    @Volatile private var bridgedVid = 0
+    @Volatile private var bridgedPid = 0
     private val lastTouchKey = intArrayOf(-1, -1)  // [left, right]
     private var clickSide = -1                     // -1 none, 0 left, 1 right
 
@@ -136,9 +141,25 @@ object DualSenseBridge {
     @JvmStatic
     fun isActive(): Boolean = lastFrameMs != 0L && SystemClock.elapsedRealtime() - lastFrameMs < 1000L
 
+    /**
+     * True when [dev] is the same physical controller the SDL3 bridge is currently streaming.
+     * Android reports that controller too (basic input), so DroidDeck's own gamepad handling must
+     * ignore it while the bridge is active, otherwise every press arrives twice.
+     * Hook it where DroidDeck handles gamepad key / motion events, e.g.
+     *     if (DualSenseBridge.isBridged(event.device)) return true
+     */
+    @JvmStatic
+    fun isBridged(dev: InputDevice?): Boolean =
+        dev != null && isActive() && bridgedVid != 0 &&
+            dev.vendorId == bridgedVid && dev.productId == bridgedPid
+
+    @JvmStatic fun isBridged(e: KeyEvent): Boolean = isBridged(e.device)
+    @JvmStatic fun isBridged(e: MotionEvent): Boolean = isBridged(e.device)
+
     private fun onFrame(b: Bundle) {
         val p = pad ?: return
         lastFrameMs = SystemClock.elapsedRealtime()
+        bridgedVid = b.getInt("vid"); bridgedPid = b.getInt("pid")
         val mask = b.getInt("mask")
         val ax = floatArrayOf(
             stick(b.getInt("lx")), stick(b.getInt("ly")), stick(b.getInt("rx")), stick(b.getInt("ry")),
@@ -158,7 +179,7 @@ object DualSenseBridge {
                 for ((bit, grip) in GRIPS) if (((diff shr bit) and 1) != 0) {
                     DeckControls.setGrip(grip, ((mask shr bit) and 1) != 0)
                 }
-                if (MAP_TOUCHPAD && ((diff shr 13) and 1) != 0) {
+                if (MAP_TOUCHPAD && !b.containsKey("padL") && ((diff shr 13) and 1) != 0) {
                     if (((mask shr 13) and 1) != 0) {
                         val sides = sidesOf(b.getIntArray("touch"))
                         clickSide = if (sides == 1) 0 else 1   // only left finger -> left click, else right
@@ -170,7 +191,7 @@ object DualSenseBridge {
                 }
             }
         }
-        if (MAP_TOUCHPAD) touch(b.getIntArray("touch"))
+        if (MAP_TOUCHPAD && !decoupledTouch(b)) touch(b.getIntArray("touch"))
         val g = b.getFloatArray("gyro")
         val a = b.getFloatArray("accel")
         if (g != null && a != null) {
@@ -186,6 +207,35 @@ object DualSenseBridge {
         s.right = ((mask shr 18) and 1) != 0
         s.leftX = ax[0]; s.leftY = ax[1]; s.rightX = ax[2]; s.rightY = ax[3]
         s.leftTrigger = ax[4]; s.rightTrigger = ax[5]
+    }
+
+    /**
+     * Newer bridge builds split the touchpad themselves (see the bridge's Touchpad layout setting):
+     * padL / padR = [down, x, y] with x and y already in -1..1 for that trackpad, padClick = -1 / 0 (left) / 1 (right).
+     * @return false when the bridge does not send this data (older bridge), so the caller falls back to raw fingers.
+     */
+    private fun decoupledTouch(b: Bundle): Boolean {
+        val l = b.getFloatArray("padL") ?: return false
+        val r = b.getFloatArray("padR") ?: return false
+        if (l.size < 3 || r.size < 3) return false
+        decoupledPad(false, l)
+        decoupledPad(true, r)
+        val c = b.getInt("padClick", -1)
+        if (c != clickSide) {
+            if (clickSide >= 0) DeckControls.setClick(clickSide == 1, false)
+            if (c >= 0) DeckControls.setClick(c == 1, true)
+            clickSide = c
+        }
+        return true
+    }
+
+    private fun decoupledPad(right: Boolean, p: FloatArray) {
+        val slot = if (right) 1 else 0
+        val touching = p[0] > 0.5f
+        val key = if (touching) (((p[1] * 127f).toInt() and 0xFF) shl 8) or ((p[2] * 127f).toInt() and 0xFF) else -1
+        if (key == lastTouchKey[slot]) return
+        lastTouchKey[slot] = key
+        if (touching) DeckControls.setPad(right, true, p[1], p[2]) else DeckControls.setPad(right, false)
     }
 
     /** Bit 0 = a finger on the left half, bit 1 = a finger on the right half. */
