@@ -68,6 +68,7 @@ object DualSenseBridge {
     private var lastMask = 0
     private val lastAxes = FloatArray(6)
     private var lastApplyMs = 0L
+    @Volatile private var lastFrameMs = 0L
     private val lastTouchKey = intArrayOf(-1, -1)  // [left, right]
     private var clickSide = -1                     // -1 none, 0 left, 1 right
 
@@ -131,8 +132,13 @@ object DualSenseBridge {
         return if (Math.abs(f) < DEAD_ZONE) 0f else f
     }
 
+    /** True while the DualSense is streaming; PadMotion uses this to stop writing the phone's gyro. */
+    @JvmStatic
+    fun isActive(): Boolean = lastFrameMs != 0L && SystemClock.elapsedRealtime() - lastFrameMs < 1000L
+
     private fun onFrame(b: Bundle) {
         val p = pad ?: return
+        lastFrameMs = SystemClock.elapsedRealtime()
         val mask = b.getInt("mask")
         val ax = floatArrayOf(
             stick(b.getInt("lx")), stick(b.getInt("ly")), stick(b.getInt("rx")), stick(b.getInt("ry")),
@@ -218,6 +224,7 @@ object DualSenseBridge {
 
     /** Neutral state: called when the bridge disconnects so nothing stays stuck. */
     private fun release() {
+        lastFrameMs = 0L
         val p = pad ?: return
         lastMask = 0
         lastAxes.fill(0f)

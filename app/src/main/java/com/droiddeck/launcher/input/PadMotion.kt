@@ -59,8 +59,9 @@ class PadMotion(private val context: Context, private val rotation: () -> Int) :
 
     private fun follow(handler: Handler, gyroscope: Sensor?, accelerometer: Sensor?) {
         val touch = SteamTouchDevice.current
-        val wanted = FakeInputWriter.readImuMode(SLOT) != 0 ||
+        val wantedRaw = FakeInputWriter.readImuMode(SLOT) != 0 ||
             touch != null && touch.plugged && touch.gyroRequested && touch.motionEnabled
+            val wanted = wantedRaw && !DualSenseBridge.isActive()
         idlePolls = if (wanted) 0 else idlePolls + 1
         if (wanted && !reading) {
             reading = true
@@ -84,6 +85,7 @@ class PadMotion(private val context: Context, private val rotation: () -> Int) :
 
     override fun onSensorChanged(event: SensorEvent) {
         if (!active) return
+        if (DualSenseBridge.isActive()) return
         val values = event.values
         if (event.timestamp - turnAt > ROTATION_REFRESH_NS) {
             turn = rotation()
