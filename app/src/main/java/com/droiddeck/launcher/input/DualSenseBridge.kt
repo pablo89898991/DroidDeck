@@ -19,7 +19,7 @@ import android.os.SystemClock
  *
  *  sticks / triggers / D-pad / face + shoulder buttons -> PadBridge.applyExternal
  *  Edge paddles (L/R)  -> Deck grips L4 / R4;  Edge Fn (L/R) -> L5 / R5
- *  touchpad            -> right Deck trackpad (+ click)
+ *  touchpad            -> left half = left Deck trackpad, right half = right trackpad (+ click)
  *  gyro / accel        -> FakeInputWriter.writeMotion (slot 0)
  *
  * Usage:  DualSenseBridge.attach(context, padBridge)  when the session starts,
@@ -41,7 +41,10 @@ object DualSenseBridge {
     private const val ACCEL_LSB_PER_G = 16384f       // Steam Deck IMU: 2 g full scale (assumed)
     private val GYRO_SIGN = floatArrayOf(1f, 1f, 1f) // flip an entry to -1f if an axis feels inverted
     private val ACCEL_SIGN = floatArrayOf(1f, 1f, 1f)
-    private const val MAP_TOUCHPAD = true
+    private const val GYRO_GAIN = 1f                 // multiplies gyro only; raise if motion is too slow
+    private const val MAP_TOUCHPAD = true            // left half = left trackpad, right half = right trackpad
+    private const val TOUCH_HALF = 960               // DualSense touchpad is 1920 x 1080
+    private const val TOUCH_H = 1079f
 
     // bridge mask bit -> PadState button
     private val BUTTONS = mapOf(
@@ -65,7 +68,8 @@ object DualSenseBridge {
     private var lastMask = 0
     private val lastAxes = FloatArray(6)
     private var lastApplyMs = 0L
-    private var lastTouchKey = -1
+    private val lastTouchKey = intArrayOf(-1, -1)  // [left, right]
+    private var clickSide = -1                     // -1 none, 0 left, 1 right
 
     private val inbox = Messenger(object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(m: Message) {
@@ -148,14 +152,23 @@ object DualSenseBridge {
                 for ((bit, grip) in GRIPS) if (((diff shr bit) and 1) != 0) {
                     DeckControls.setGrip(grip, ((mask shr bit) and 1) != 0)
                 }
-                if (MAP_TOUCHPAD && ((diff shr 13) and 1) != 0) DeckControls.setClick(true, ((mask shr 13) and 1) != 0)
+                if (MAP_TOUCHPAD && ((diff shr 13) and 1) != 0) {
+                    if (((mask shr 13) and 1) != 0) {
+                        val sides = sidesOf(b.getIntArray("touch"))
+                        clickSide = if (sides == 1) 0 else 1   // only left finger -> left click, else right
+                        DeckControls.setClick(clickSide == 1, true)
+                    } else if (clickSide >= 0) {
+                        DeckControls.setClick(clickSide == 1, false)
+                        clickSide = -1
+                    }
+                }
             }
         }
         if (MAP_TOUCHPAD) touch(b.getIntArray("touch"))
         val g = b.getFloatArray("gyro")
         val a = b.getFloatArray("accel")
         if (g != null && a != null) {
-            FakeInputWriter.writeMotion(0, shorts(a, ACCEL_LSB_PER_G, ACCEL_SIGN), shorts(g, GYRO_LSB_PER_DPS, GYRO_SIGN))
+            FakeInputWriter.writeMotion(0, shorts(a, ACCEL_LSB_PER_G, ACCEL_SIGN), shorts(g, GYRO_LSB_PER_DPS * GYRO_GAIN, GYRO_SIGN))
         }
     }
 
@@ -169,13 +182,35 @@ object DualSenseBridge {
         s.leftTrigger = ax[4]; s.rightTrigger = ax[5]
     }
 
+    /** Bit 0 = a finger on the left half, bit 1 = a finger on the right half. */
+    private fun sidesOf(t: IntArray?): Int {
+        var r = 0
+        var i = 0
+        while (t != null && i + 2 < t.size) { r = r or (if (t[i + 1] < TOUCH_HALF) 1 else 2); i += 3 }
+        return r
+    }
+
     private fun touch(t: IntArray?) {
-        val touching = t != null && t.size >= 3
-        val key = if (touching) ((t!![1] shr 4) shl 16) or (t[2] shr 4) else -1
-        if (key == lastTouchKey) return
-        lastTouchKey = key
-        if (touching) DeckControls.setPad(true, true, t!![1] / 1919f * 2f - 1f, t[2] / 1079f * 2f - 1f)
-        else DeckControls.setPad(true, false)
+        var left: IntArray? = null
+        var right: IntArray? = null
+        var i = 0
+        while (t != null && i + 2 < t.size) {
+            val pt = intArrayOf(t[i + 1], t[i + 2])
+            if (pt[0] < TOUCH_HALF) { if (left == null) left = pt } else { if (right == null) right = pt }
+            i += 3
+        }
+        pad(false, left)
+        pad(true, right)
+    }
+
+    private fun pad(right: Boolean, pt: IntArray?) {
+        val slot = if (right) 1 else 0
+        val key = if (pt != null) ((pt[0] shr 4) shl 16) or (pt[1] shr 4) else -1
+        if (key == lastTouchKey[slot]) return
+        lastTouchKey[slot] = key
+        if (pt == null) { DeckControls.setPad(right, false); return }
+        val local = if (right) pt[0] - TOUCH_HALF else pt[0]
+        DeckControls.setPad(right, true, local / TOUCH_HALF.toFloat() * 2f - 1f, pt[1] / TOUCH_H * 2f - 1f)
     }
 
     private fun shorts(v: FloatArray, scale: Float, sign: FloatArray) =
@@ -186,9 +221,13 @@ object DualSenseBridge {
         val p = pad ?: return
         lastMask = 0
         lastAxes.fill(0f)
-        lastTouchKey = -1
+        lastTouchKey.fill(-1)
+        clickSide = -1
         p.applyExternal({ s: PadState -> fill(s, 0, FloatArray(6)) }, false)
         for (grip in GRIPS.values) DeckControls.setGrip(grip, false)
-        if (MAP_TOUCHPAD) { DeckControls.setPad(true, false); DeckControls.setClick(true, false) }
+        if (MAP_TOUCHPAD) {
+            DeckControls.setPad(false, false); DeckControls.setPad(true, false)
+            DeckControls.setClick(false, false); DeckControls.setClick(true, false)
+        }
     }
 }
