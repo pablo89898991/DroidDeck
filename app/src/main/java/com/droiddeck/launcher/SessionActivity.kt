@@ -457,6 +457,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         bridge.setSelectSteam(ControllerPrefs.read(this).selectSteam)
         padBridge = bridge
         SessionState.padBridge = bridge
+        com.droiddeck.launcher.input.DualSenseBridge.attach(this, bridge)
         if (Build.VERSION.SDK_INT >= 31) {
             val vr = com.droiddeck.launcher.input.JoyConVr(this, File(filesDir, ".wayland-rt/${com.droiddeck.launcher.input.JoyConVr.FILE}")) { taken, released ->
                 if (joyConVr == null) return@JoyConVr
@@ -3132,6 +3133,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         joyConVr = null
         handCamera?.stop()
         handCamera = null
+        com.droiddeck.launcher.input.DualSenseBridge.detach()
         padBridge?.stop()
         steamController?.stop()
         if (SessionState.padBridge === padBridge) SessionState.padBridge = null

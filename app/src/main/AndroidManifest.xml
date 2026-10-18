@@ -29,6 +29,8 @@
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="false" />
 
+    <uses-permission android:name="com.example.dsedge.permission.BRIDGE" />
+    <queries><package android:name="com.example.dsedge" /></queries>
     <application
         android:name=".App"
         android:localeConfig="@xml/locales_config"
