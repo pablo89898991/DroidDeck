@@ -36,6 +36,8 @@ object DualSenseBridge {
     private const val MSG_OUTPUT = 3
     private const val MSG_FRAME = 10
     private const val MSG_STATUS = 11
+    private const val MSG_PAD_GONE = 12
+    private const val SLOTS = 4
 
     // ---- Tunables (verify on device) ----
     private const val DEAD_ZONE = 0.12f              // same as PadBridge
@@ -46,8 +48,8 @@ object DualSenseBridge {
     private val ACCEL_SIGN = floatArrayOf(1f, 1f, 1f)
     private const val GYRO_GAIN = 1f                 // multiplies gyro only; raise if motion is too slow
     // Touchpad orientation on the DroidDeck side (the bridge app has the same settings; use one or the other, not both).
-    private const val TOUCH_INV_X = true
-    private const val TOUCH_INV_Y = true
+    private const val TOUCH_INV_X = false
+    private const val TOUCH_INV_Y = false
     private const val TOUCH_SWAP = false
     private const val MAP_TOUCHPAD = true            // left half = left trackpad, right half = right trackpad
     private const val TOUCH_HALF = 960               // DualSense touchpad is 1920 x 1080
@@ -75,9 +77,14 @@ object DualSenseBridge {
     private var lastMask = 0
     private val lastAxes = FloatArray(6)
     private var lastApplyMs = 0L
-    @Volatile private var lastFrameMs = 0L
-    @Volatile private var bridgedVid = 0
-    @Volatile private var bridgedPid = 0
+    // Per bridge slot (0 = player 1 with all features, 1..3 = extra controllers: buttons, sticks, triggers, gyro, rumble).
+    private val vidS = IntArray(SLOTS)
+    private val pidS = IntArray(SLOTS)
+    private val frameMsS = LongArray(SLOTS)
+    private val ddSlot = intArrayOf(0, -1, -1, -1)       // bridge slot -> DroidDeck player slot (-1 = not claimed)
+    private val maskS = IntArray(SLOTS)
+    private val axesS = Array(SLOTS) { FloatArray(6) }
+    private val applyMsS = LongArray(SLOTS)
     private val lastTouchKey = intArrayOf(-1, -1)  // [left, right]
     private var clickSide = -1                     // -1 none, 0 left, 1 right
 
@@ -86,6 +93,7 @@ object DualSenseBridge {
             when (m.what) {
                 MSG_FRAME -> onFrame(m.data)
                 MSG_STATUS -> if (m.data.getString("text")?.startsWith("Connected") != true) release()
+                MSG_PAD_GONE -> padGone(m.data.getInt("slot"))
             }
         }
     })
@@ -125,12 +133,21 @@ object DualSenseBridge {
         server = null
     }
 
-    /** Forward game rumble (0..255 each) to the physical controller. */
+    /** Forward game rumble (0..255 each) to the physical controller of player 1. */
     @JvmStatic
-    fun rumble(strong: Int, weak: Int) =
+    fun rumble(strong: Int, weak: Int) = rumble(0, strong, weak)
+
+    /** Rumble for a DroidDeck player slot (0 = player 1). */
+    @JvmStatic
+    fun rumble(deckSlot: Int, strong: Int, weak: Int) {
+        val bridgeSlot = (0 until SLOTS).firstOrNull { ddSlot[it] == deckSlot } ?: return
         send(Message.obtain(null, MSG_OUTPUT).apply {
-            data = Bundle().apply { putInt("rl", strong.coerceIn(0, 255)); putInt("rr", weak.coerceIn(0, 255)) }
+            data = Bundle().apply {
+                putInt("slot", bridgeSlot)
+                putInt("rl", strong.coerceIn(0, 255)); putInt("rr", weak.coerceIn(0, 255))
+            }
         })
+    }
 
     private fun send(m: Message) { try { server?.send(m) } catch (_: RemoteException) {} }
 
@@ -141,29 +158,83 @@ object DualSenseBridge {
         return if (Math.abs(f) < DEAD_ZONE) 0f else f
     }
 
-    /** True while the DualSense is streaming; PadMotion uses this to stop writing the phone's gyro. */
+    /** True while player 1's controller is streaming; PadMotion uses this to stop writing the phone's gyro. */
     @JvmStatic
-    fun isActive(): Boolean = lastFrameMs != 0L && SystemClock.elapsedRealtime() - lastFrameMs < 1000L
+    fun isActive(): Boolean = frameMsS[0] != 0L && SystemClock.elapsedRealtime() - frameMsS[0] < 1000L
 
     /**
-     * True when [dev] is the same physical controller the SDL3 bridge is currently streaming.
+     * True when [dev] is the same physical controller the SDL3 bridge is currently streaming (any player slot).
      * Android reports that controller too (basic input), so DroidDeck's own gamepad handling must
      * ignore it while the bridge is active, otherwise every press arrives twice.
-     * Hook it where DroidDeck handles gamepad key / motion events, e.g.
-     *     if (DualSenseBridge.isBridged(event.device)) return true
      */
     @JvmStatic
-    fun isBridged(dev: InputDevice?): Boolean =
-        dev != null && isActive() && bridgedVid != 0 &&
-            dev.vendorId == bridgedVid && dev.productId == bridgedPid
+    fun isBridged(dev: InputDevice?): Boolean {
+        if (dev == null) return false
+        val now = SystemClock.elapsedRealtime()
+        for (i in 0 until SLOTS) {
+            if (vidS[i] != 0 && frameMsS[i] != 0L && now - frameMsS[i] < 1000L &&
+                dev.vendorId == vidS[i] && dev.productId == pidS[i]) return true
+        }
+        return false
+    }
 
     @JvmStatic fun isBridged(e: KeyEvent): Boolean = isBridged(e.device)
     @JvmStatic fun isBridged(e: MotionEvent): Boolean = isBridged(e.device)
 
-    private fun onFrame(b: Bundle) {
+    /** A controller in bridge slot [slot] was unplugged. */
+    private fun padGone(slot: Int) {
+        if (slot !in 0 until SLOTS) return
+        if (slot == 0) { release(); return }
+        val p = pad
+        val dd = ddSlot[slot]
+        if (p != null && dd > 0) {
+            p.applyExternalSlot(dd, { s: PadState -> fill(s, 0, FloatArray(6)) }, false)
+            p.releaseBridgeSlot(dd)
+        }
+        ddSlot[slot] = -1
+        frameMsS[slot] = 0L
+        vidS[slot] = 0; pidS[slot] = 0
+        maskS[slot] = 0; axesS[slot].fill(0f)
+    }
+
+    /** Extra controllers (bridge slots 1..3) become DroidDeck players 2..4: plain gamepad plus gyro. */
+    private fun onExtraFrame(slot: Int, b: Bundle) {
         val p = pad ?: return
-        lastFrameMs = SystemClock.elapsedRealtime()
-        bridgedVid = b.getInt("vid"); bridgedPid = b.getInt("pid")
+        val now = SystemClock.elapsedRealtime()
+        frameMsS[slot] = now
+        vidS[slot] = b.getInt("vid"); pidS[slot] = b.getInt("pid")
+        var dd = ddSlot[slot]
+        if (dd <= 0) {
+            dd = p.claimBridgeSlot()
+            if (dd <= 0) return                      // all DroidDeck player slots are taken
+            ddSlot[slot] = dd
+        }
+        val mask = b.getInt("mask")
+        val ax = floatArrayOf(
+            stick(b.getInt("lx")), stick(b.getInt("ly")), stick(b.getInt("rx")), stick(b.getInt("ry")),
+            b.getInt("l2") / 255f, b.getInt("r2") / 255f,
+        )
+        val buttonsChanged = mask != maskS[slot]
+        val axesChanged = !ax.contentEquals(axesS[slot])
+        if (buttonsChanged || (axesChanged && now - applyMsS[slot] >= MIN_AXIS_INTERVAL_MS)) {
+            maskS[slot] = mask
+            ax.copyInto(axesS[slot])
+            applyMsS[slot] = now
+            p.applyExternalSlot(dd, { s: PadState -> fill(s, mask, ax) }, buttonsChanged)
+        }
+        val g = b.getFloatArray("gyro")
+        val a = b.getFloatArray("accel")
+        if (g != null && a != null) {
+            FakeInputWriter.writeMotion(dd, shorts(a, ACCEL_LSB_PER_G, ACCEL_SIGN), shorts(g, GYRO_LSB_PER_DPS * GYRO_GAIN, GYRO_SIGN))
+        }
+    }
+
+    private fun onFrame(b: Bundle) {
+        val slot = b.getInt("slot", 0).coerceIn(0, SLOTS - 1)
+        if (slot != 0) { onExtraFrame(slot, b); return }
+        val p = pad ?: return
+        frameMsS[0] = SystemClock.elapsedRealtime()
+        vidS[0] = b.getInt("vid"); pidS[0] = b.getInt("pid")
         val mask = b.getInt("mask")
         val ax = floatArrayOf(
             stick(b.getInt("lx")), stick(b.getInt("ly")), stick(b.getInt("rx")), stick(b.getInt("ry")),
@@ -284,7 +355,8 @@ object DualSenseBridge {
 
     /** Neutral state: called when the bridge disconnects so nothing stays stuck. */
     private fun release() {
-        lastFrameMs = 0L
+        frameMsS[0] = 0L
+        for (k in 1 until SLOTS) padGone(k)
         val p = pad ?: return
         lastMask = 0
         lastAxes.fill(0f)
