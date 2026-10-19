@@ -200,5 +200,27 @@ else
   if [ "$n" -gt 0 ]; then ok "app name = SDL3Deck ($n locale file(s))"; else warn "app name not changed (app_name string not found)"; fi
 fi
 
+# ---------- 7. Docker Hub auth for the build (avoids the registry pull limit) ----------
+BUILDYML="$DD/.github/workflows/build.yml"
+if [ -f "$BUILDYML" ]; then
+  if grep -q "Log in to Docker Hub" "$BUILDYML"; then
+    skip "build.yml Docker Hub auth"
+  else
+    # pull the base Debian image from Docker Hub (authenticated) instead of the rate-limited public ECR
+    sed -i 's#public.ecr.aws/docker/library/debian:bullseye#docker.io/library/debian:bullseye#g' "$BUILDYML"
+    cat > /tmp/_dockerlogin.txt <<'YML'
+      - name: Log in to Docker Hub (lifts the registry pull limit)
+        if: ${{ secrets.DOCKERHUB_USER != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+YML
+    insert_before "- name: Fetch the Debian image the preloads build in" /tmp/_dockerlogin.txt "$BUILDYML"
+    if grep -q "Log in to Docker Hub" "$BUILDYML"; then ok "build.yml Docker Hub auth (set secrets DOCKERHUB_USER + DOCKERHUB_TOKEN)"; else warn "build.yml Docker Hub auth not inserted (anchor not found)"; fi
+  fi
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
