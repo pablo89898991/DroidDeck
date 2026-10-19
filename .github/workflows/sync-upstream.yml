@@ -7,6 +7,8 @@
 # instead of merging, so it never hits git conflicts.
 #
 # One-time setup: see sdl3/SETUP-autoupdate.md.
+# REQUIRES a repo secret SYNC_PAT = a GitHub PAT with 'repo' + 'workflow' scope, because the built-in
+# GITHUB_TOKEN is not allowed to push .github/workflows/* files (which the upstream overlay includes).
 name: Sync upstream + patch
 
 on:
@@ -34,6 +36,7 @@ jobs:
         with:
           ref: ${{ env.BUILD_BRANCH }}
           fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}      # PAT with repo + workflow scope (GITHUB_TOKEN cannot push workflow files)
 
       - name: Fetch latest upstream DroidDeck
         run: |
@@ -65,5 +68,5 @@ jobs:
       - name: Trigger Build APK on the build branch
         if: steps.commit.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: gh workflow run "Build APK" --ref "${BUILD_BRANCH}"
