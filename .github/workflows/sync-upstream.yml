@@ -1,0 +1,69 @@
+# Auto-update: pull the latest upstream DroidDeck, re-apply the SDL3 bridge patch, rebuild SDL3Deck.
+#
+# This file lives on your fork's DEFAULT branch (main) -- GitHub only runs scheduled workflows from the
+# default branch. It does NOT build from main; it operates entirely on the BUILD_BRANCH below.
+# Each run overlays the newest upstream DroidDeck onto that branch (keeping only the sdl3/ tooling),
+# runs the patcher, commits, and triggers upstream's own "Build APK" on that branch. It overwrites
+# instead of merging, so it never hits git conflicts.
+#
+# One-time setup: see sdl3/SETUP-autoupdate.md.
+name: Sync upstream + patch
+
+on:
+  schedule:
+    - cron: '0 5 * * *'      # daily 05:00 UTC; change to taste
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write             # needed to trigger the Build APK workflow
+
+env:
+  BUILD_BRANCH: sdl3deck     # the dedicated branch that holds the patched build
+
+concurrency:
+  group: sdl3-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the build branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch latest upstream DroidDeck
+        run: |
+          git clone --depth 1 https://github.com/Droid-Deck/DroidDeck /tmp/up
+          rm -rf /tmp/up/.git
+
+      - name: Overlay upstream over the build branch (keep only sdl3/ tooling)
+        run: |
+          rsync -a --delete --exclude '.git' --exclude 'sdl3/' /tmp/up/ ./
+
+      - name: Apply the SDL3 bridge patch (also renames the app to SDL3Deck)
+        run: bash sdl3/patch-droiddeck.sh .
+
+      - name: Commit and push to the build branch if anything changed
+        id: commit
+        run: |
+          git config user.name  "sdl3-sync[bot]"
+          git config user.email "sdl3-sync@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes since last sync."
+          else
+            git commit -m "Sync upstream DroidDeck + SDL3 bridge patch ($(date -u +%Y-%m-%d))"
+            git push origin "HEAD:${BUILD_BRANCH}"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger Build APK on the build branch
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run "Build APK" --ref "${BUILD_BRANCH}"
