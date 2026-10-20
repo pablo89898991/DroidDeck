@@ -328,6 +328,9 @@ patch(cpp, [
      '(a DualSense Edge)'),
     ('  uint8_t system = (buttons & 1024 ? 0x01 : 0) | (click ? 0x02 : 0);',
      '  uint8_t system = (buttons & 1024 ? 0x01 : 0) | (click ? 0x02 : 0);\n'
+     '  // DualSense / Edge mute (microphone) button -> bit 0x04 of this byte. The bridge maps the mute\n'
+     '  // button to the Deck QAM bit; DualShock 4 (model 4) has no mute and reuses 0x04 for its counter.\n'
+     '  if (model != 4 && (buttons & SNAPSHOT_QAM_BIT)) system |= 0x04;\n'
      '  // DualSense Edge extra buttons: SDL/Steam read all four from this byte on PID 0x0df2 --\n'
      '  //   0x10 left Fn, 0x20 right Fn, 0x40 left back paddle, 0x80 right back paddle.\n'
      '  // model 6 == the Edge node; plain DualSense (5) and DS4 (4) are left untouched. Deck grips map 1:1:\n'
@@ -387,6 +390,14 @@ patch(cpp, [
     ('kNames[was % 5]',
      'kNames[was % 6]',
      'kNames[was % 6]'),
+    # Sony touchpad (DualShock 4, DualSense, DualSense Edge): one full-width multitouch surface, never
+    # the Deck's two halves. A real Sony pad is a single surface where finger 0 is the primary touch,
+    # so confining finger 1 to the right half loses any touch that lands on it alone. put_sony_touch is
+    # only ever used by Sony pads, so making it full-width for all of them is correct.
+    ('  int half = SONY_TOUCH_WIDTH / 2;\n'
+     '  int px = side * half + (static_cast<int>(x) + 32768) * (half - 1) / 65535;',
+     '  int px = (static_cast<int>(x) + 32768) * (SONY_TOUCH_WIDTH - 1) / 65535;',
+     'int px = (static_cast<int>(x) + 32768) * (SONY_TOUCH_WIDTH - 1) / 65535;'),
 ])
 sys.stdout.write("OK\n")
 PY
