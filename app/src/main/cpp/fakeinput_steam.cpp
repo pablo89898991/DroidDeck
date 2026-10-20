@@ -1513,8 +1513,7 @@ __attribute__((visibility("hidden"))) static void put_sony_touch(uint8_t *at, So
                                                                     bool down, int16_t x, int16_t y, int height) {
   if (down && !touch.down[side]) touch.id[side] = touch.next_id++ & 0x7f;
   touch.down[side] = down;
-  int half = SONY_TOUCH_WIDTH / 2;
-  int px = side * half + (static_cast<int>(x) + 32768) * (half - 1) / 65535;
+  int px = (static_cast<int>(x) + 32768) * (SONY_TOUCH_WIDTH - 1) / 65535;
   int py = (32767 - static_cast<int>(y)) * (height - 1) / 65535;
   at[0] = static_cast<uint8_t>(touch.id[side] | (down ? 0 : 0x80));
   at[1] = static_cast<uint8_t>(px & 0xff);
@@ -1542,6 +1541,9 @@ build_sony_report(uint8_t *report, uint8_t model, uint32_t packet, uint64_t elap
                       (buttons & 256 ? 0x40 : 0) | (buttons & 512 ? 0x80 : 0);
   bool click = extras.controls & (DECK_EXTRA_LPAD_CLICK | DECK_EXTRA_RPAD_CLICK);
   uint8_t system = (buttons & 1024 ? 0x01 : 0) | (click ? 0x02 : 0);
+  // DualSense / Edge mute (microphone) button -> bit 0x04 of this byte. The bridge maps the mute
+  // button to the Deck QAM bit; DualShock 4 (model 4) has no mute and reuses 0x04 for its counter.
+  if (model != 4 && (buttons & SNAPSHOT_QAM_BIT)) system |= 0x04;
   // DualSense Edge extra buttons: SDL/Steam read all four from this byte on PID 0x0df2 --
   //   0x10 left Fn, 0x20 right Fn, 0x40 left back paddle, 0x80 right back paddle.
   // model 6 == the Edge node; plain DualSense (5) and DS4 (4) are left untouched. Deck grips map 1:1:
