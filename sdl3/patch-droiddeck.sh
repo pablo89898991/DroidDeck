@@ -210,11 +210,15 @@ if [ -f "$BUILDYML" ]; then
     sed -i 's#public.ecr.aws/docker/library/debian:bullseye#docker.io/library/debian:bullseye#g' "$BUILDYML"
     cat > /tmp/_dockerlogin.txt <<'YML'
       - name: Log in to Docker Hub (lifts the registry pull limit)
-        if: ${{ secrets.DOCKERHUB_USER != '' }}
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USER }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USER }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
+            echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+          else
+            echo "No Docker Hub secrets set; using anonymous pull."
+          fi
 
 YML
     insert_before "- name: Fetch the Debian image the preloads build in" /tmp/_dockerlogin.txt "$BUILDYML"
