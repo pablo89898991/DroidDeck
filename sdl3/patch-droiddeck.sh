@@ -397,5 +397,38 @@ else
   warn "fakeinput_steam.cpp / SteamDeckPad.kt / FakeInputWriter.java not found (skipping Edge pad type)"
 fi
 
+# ---------- 10. Unlock ADPF game-thread boosting beyond the Odin 3 ----------
+# GameThreadHints uses Android's PerformanceHintManager to push the game's busiest threads onto the
+# prime CPU cores. It was hard-gated to the Odin 3 (SoC CQ8725S). It is a PURE scheduling hint -- it
+# cannot change how a game runs, so it cannot hurt compatibility -- and it stays behind the user's
+# "game thread hints" setting. Open it to any Qualcomm SoC (same WALT scheduler / power-HAL family),
+# which includes the Snapdragon 8 Gen 2 (SM8550).
+GTH="$PKG/session/GameThreadHints.kt"
+if [ -f "$GTH" ]; then
+  if python3 - "$GTH" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+if "game thread hints: Qualcomm only" not in s:
+    old = '        if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL != "CQ8725S") return "game thread hints: Odin 3 only"'
+    new = ('        if (Build.VERSION.SDK_INT < 31) return "game thread hints: needs Android 12+"\n'
+           '        // ADPF boosting is a pure scheduling hint (it cannot change how a game runs), so allow it on\n'
+           '        // any Qualcomm SoC -- the same WALT scheduler / power-HAL family it was tuned on (Odin 3).\n'
+           '        val qualcomm = Build.SOC_MANUFACTURER == "QTI" || Build.SOC_MODEL.startsWith("SM") || Build.SOC_MODEL == "CQ8725S"\n'
+           '        if (!qualcomm) return "game thread hints: Qualcomm only (tuned on Odin 3)"')
+    if s.count(old) != 1:
+        sys.stderr.write("ANCHOR-MISS GameThreadHints device gate (found %d)\n" % s.count(old))
+        sys.exit(3)
+    s = s.replace(old, new, 1)
+    open(p, 'w', encoding='utf-8').write(s)
+sys.stdout.write("OK\n")
+PY
+  then ok "ADPF game-thread boosting unlocked (any Qualcomm SoC)"
+  else die "GameThreadHints patch failed: an upstream anchor moved (see ANCHOR-MISS above)."
+  fi
+else
+  warn "GameThreadHints.kt not found (skipping ADPF unlock)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
