@@ -41,7 +41,7 @@ object DualSenseBridge {
 
     // ---- Tunables (verify on device) ----
     private const val DEAD_ZONE = 0.12f              // same as PadBridge
-    private const val MIN_AXIS_INTERVAL_MS = 8L      // don't flood the input ring with stick jitter
+    private const val MIN_AXIS_INTERVAL_MS = 4L      // don't flood the input ring with stick jitter
     private const val GYRO_LSB_PER_DPS = 16.384f     // Steam Deck IMU: 2000 dps full scale (assumed)
     private const val ACCEL_LSB_PER_G = 16384f       // Steam Deck IMU: 2 g full scale (assumed)
     private val GYRO_SIGN = floatArrayOf(1f, 1f, 1f) // flip an entry to -1f if an axis feels inverted
@@ -107,7 +107,8 @@ object DualSenseBridge {
     private val lastSepPads = ShortArray(4)
     private val lastSepPressure = ShortArray(2)
 
-    private val inbox = Messenger(object : Handler(Looper.getMainLooper()) {
+    private val worker = android.os.HandlerThread("ds-bridge", android.os.Process.THREAD_PRIORITY_DISPLAY).apply { start() }
+    private val inbox = Messenger(object : Handler(worker.looper) {
         override fun handleMessage(m: Message) {
             when (m.what) {
                 MSG_FRAME -> onFrame(m.data)
@@ -412,7 +413,7 @@ object DualSenseBridge {
     private fun decoupledPad(right: Boolean, p: FloatArray) {
         val slot = if (right) 1 else 0
         val touching = p[0] > 0.5f
-        val key = if (touching) (((p[1] * 127f).toInt() and 0xFF) shl 8) or ((p[2] * 127f).toInt() and 0xFF) else -1
+        val key = if (touching) (((p[1] * 1023f).toInt() and 0x7FF) shl 11) or ((p[2] * 1023f).toInt() and 0x7FF) else -1
         if (key == lastTouchKey[slot]) return
         lastTouchKey[slot] = key
         if (touching) {
