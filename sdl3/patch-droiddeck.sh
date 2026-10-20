@@ -241,5 +241,161 @@ else
   warn "RumbleComponent.kt not found (skipping rumble routing)"
 fi
 
+# ---------- 9. Add a native DualSense Edge (054c:0df2) as a SEPARATE pad type ----------
+# A standard DualSense (054c:0ce6) has no back buttons in its HID report; a DualSense Edge (054c:0df2)
+# does -- SDL/Steam read its 2 back paddles + 2 Fn buttons from one button byte. We add the Edge as its
+# own fake controller (new hidraw node 22, pad type 5) ALONGSIDE the untouched plain DualSense, and feed
+# the Deck grips into the Edge's extra-button bits. Plain DualSense (option "DualSense (native)") is kept.
+CPP="$DD/app/src/main/cpp/fakeinput_steam.cpp"
+SDP="$PKG/session/SteamDeckPad.kt"
+FIW="$IN/FakeInputWriter.java"
+if [ -f "$CPP" ] && [ -f "$SDP" ] && [ -f "$FIW" ]; then
+  if python3 - "$CPP" "$SDP" "$FIW" <<'PY'
+import sys
+cpp, sdp, fiw = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def patch(path, edits):
+    s = open(path, encoding='utf-8').read()
+    for old, new, marker in edits:
+        if marker in s:
+            continue  # already applied (idempotent)
+        n = s.count(old)
+        if n != 1:
+            sys.stderr.write("ANCHOR-MISS %s :: %r (found %d, expected 1)\n" % (path, old[:70], n))
+            sys.exit(3)
+        s = s.replace(old, new, 1)
+    open(path, 'w', encoding='utf-8').write(s)
+
+# ---- FakeInputWriter.java: the Java-side pad-type constant ----
+patch(fiw, [
+    ('    public static final int PAD_TYPE_DUALSENSE = 4;',
+     '    public static final int PAD_TYPE_DUALSENSE = 4;\n'
+     '    public static final int PAD_TYPE_DUALSENSE_EDGE = 5;',
+     'PAD_TYPE_DUALSENSE_EDGE = 5'),
+])
+
+# ---- SteamDeckPad.kt: new node (minor 22) + Edge identity; describeSony refactored to explicit params ----
+patch(sdp, [
+    ('    private const val SONY_DUALSENSE_MINOR = 21',
+     '    private const val SONY_DUALSENSE_MINOR = 21\n'
+     '    private const val SONY_DUALSENSE_EDGE_MINOR = 22',
+     'SONY_DUALSENSE_EDGE_MINOR = 22'),
+    ('            com.droiddeck.launcher.input.FakeInputWriter.PAD_TYPE_DUALSENSE -> SONY_DUALSENSE_MINOR',
+     '            com.droiddeck.launcher.input.FakeInputWriter.PAD_TYPE_DUALSENSE -> SONY_DUALSENSE_MINOR\n'
+     '            com.droiddeck.launcher.input.FakeInputWriter.PAD_TYPE_DUALSENSE_EDGE -> SONY_DUALSENSE_EDGE_MINOR',
+     'PAD_TYPE_DUALSENSE_EDGE -> SONY_DUALSENSE_EDGE_MINOR'),
+    ('            fun describeSony(dualSense: Boolean) {\n'
+     '                val bus = if (dualSense) 5 else 4\n'
+     '                val product = if (dualSense) "0ce6" else "09cc"\n'
+     '                val minor = if (dualSense) SONY_DUALSENSE_MINOR else SONY_DS4_MINOR\n'
+     '                val node = "hidraw$minor"\n'
+     '                val name = if (dualSense) "DualSense Wireless Controller" else "Wireless Controller"',
+     '            fun describeSony(bus: Int, product: String, minor: Int, name: String, sonyDescriptor: ByteArray) {\n'
+     '                val node = "hidraw$minor"',
+     'fun describeSony(bus: Int, product: String, minor: Int, name: String, sonyDescriptor: ByteArray)'),
+    ('File(dir(hid), "report_descriptor").writeBytes(if (dualSense) DUALSENSE_REPORT_DESCRIPTOR else DS4_REPORT_DESCRIPTOR)',
+     'File(dir(hid), "report_descriptor").writeBytes(sonyDescriptor)',
+     'writeBytes(sonyDescriptor)'),
+    ('            describeSony(dualSense = false)\n'
+     '            describeSony(dualSense = true)',
+     '            describeSony(4, "09cc", SONY_DS4_MINOR, "Wireless Controller", DS4_REPORT_DESCRIPTOR)\n'
+     '            describeSony(5, "0ce6", SONY_DUALSENSE_MINOR, "DualSense Wireless Controller", DUALSENSE_REPORT_DESCRIPTOR)\n'
+     '            describeSony(6, "0df2", SONY_DUALSENSE_EDGE_MINOR, "DualSense Edge Wireless Controller", DUALSENSE_REPORT_DESCRIPTOR)',
+     'describeSony(6, "0df2"'),
+])
+
+# ---- fakeinput_steam.cpp: enum, node constants, every sony/pad-type branch, and the Edge button bits ----
+patch(cpp, [
+    ('PAD_TYPE_DUALSENSE = 4, PAD_TYPE_LAST = PAD_TYPE_DUALSENSE;',
+     'PAD_TYPE_DUALSENSE = 4, PAD_TYPE_DUALSENSE_EDGE = 5, PAD_TYPE_LAST = PAD_TYPE_DUALSENSE_EDGE;',
+     'PAD_TYPE_DUALSENSE_EDGE = 5'),
+    ('static constexpr unsigned int DS4_HIDRAW_MINOR = 20, DUALSENSE_HIDRAW_MINOR = 21;',
+     'static constexpr unsigned int DS4_HIDRAW_MINOR = 20, DUALSENSE_HIDRAW_MINOR = 21, DUALSENSE_EDGE_HIDRAW_MINOR = 22;\n'
+     'static constexpr const char *DUALSENSE_EDGE_HIDRAW_PATH = "/dev/hidraw22";',
+     'DUALSENSE_EDGE_HIDRAW_PATH = "/dev/hidraw22"'),
+    ('  if (!strcmp(pathname, DUALSENSE_HIDRAW_PATH)) return live_pad_type() == PAD_TYPE_DUALSENSE ? 5 : 0;',
+     '  if (!strcmp(pathname, DUALSENSE_HIDRAW_PATH)) return live_pad_type() == PAD_TYPE_DUALSENSE ? 5 : 0;\n'
+     '  if (!strcmp(pathname, DUALSENSE_EDGE_HIDRAW_PATH)) return live_pad_type() == PAD_TYPE_DUALSENSE_EDGE ? 6 : 0;',
+     'DUALSENSE_EDGE_HIDRAW_PATH)) return'),
+    ('  uint32_t type = self->sony == 4 ? PAD_TYPE_DS4 : PAD_TYPE_DUALSENSE;',
+     '  uint32_t type = self->sony == 4 ? PAD_TYPE_DS4 : self->sony == 6 ? PAD_TYPE_DUALSENSE_EDGE : PAD_TYPE_DUALSENSE;',
+     'self->sony == 6 ? PAD_TYPE_DUALSENSE_EDGE'),
+    ('  const char *path = sony == 4 ? DS4_HIDRAW_PATH : sony == 5 ? DUALSENSE_HIDRAW_PATH : DECK_HIDRAW_PATH;',
+     '  const char *path = sony == 4 ? DS4_HIDRAW_PATH : sony == 5 ? DUALSENSE_HIDRAW_PATH : sony == 6 ? DUALSENSE_EDGE_HIDRAW_PATH : DECK_HIDRAW_PATH;',
+     'sony == 6 ? DUALSENSE_EDGE_HIDRAW_PATH :'),
+    ('              sony == 4 ? " (a DualShock 4)" : sony == 5 ? " (a DualSense)" : "");',
+     '              sony == 4 ? " (a DualShock 4)" : sony == 5 ? " (a DualSense)" : sony == 6 ? " (a DualSense Edge)" : "");',
+     '(a DualSense Edge)'),
+    ('  uint8_t system = (buttons & 1024 ? 0x01 : 0) | (click ? 0x02 : 0);',
+     '  uint8_t system = (buttons & 1024 ? 0x01 : 0) | (click ? 0x02 : 0);\n'
+     '  // DualSense Edge extra buttons: SDL/Steam read all four from this byte on PID 0x0df2 --\n'
+     '  //   0x10 left Fn, 0x20 right Fn, 0x40 left back paddle, 0x80 right back paddle.\n'
+     '  // model 6 == the Edge node; plain DualSense (5) and DS4 (4) are left untouched. Deck grips map 1:1:\n'
+     '  //   L4 -> left paddle, R4 -> right paddle, L5 -> left Fn, R5 -> right Fn.\n'
+     '  if (model == 6) {\n'
+     '    if (extras.controls & DECK_EXTRA_L4) system |= 0x40;\n'
+     '    if (extras.controls & DECK_EXTRA_R4) system |= 0x80;\n'
+     '    if (extras.controls & DECK_EXTRA_L5) system |= 0x10;\n'
+     '    if (extras.controls & DECK_EXTRA_R5) system |= 0x20;\n'
+     '  }',
+     'DualSense Edge extra buttons'),
+    ('static_cast<int16_t>(pad.sony == 4 ? 0x09cc : 0x0ce6)',
+     'static_cast<int16_t>(pad.sony == 4 ? 0x09cc : pad.sony == 6 ? 0x0df2 : 0x0ce6)',
+     'pad.sony == 6 ? 0x0df2'),
+    (': "Sony Interactive Entertainment DualSense Wireless Controller");',
+     ': pad.sony == 6 ? "Sony Interactive Entertainment DualSense Edge Wireless Controller" : "Sony Interactive Entertainment DualSense Wireless Controller");',
+     'DualSense Edge Wireless Controller"'),
+    ('pad.sony == 4 ? "usb-droiddeck-4/input3" : "usb-droiddeck-5/input3"',
+     'pad.sony == 4 ? "usb-droiddeck-4/input3" : pad.sony == 6 ? "usb-droiddeck-6/input3" : "usb-droiddeck-5/input3"',
+     'usb-droiddeck-6/input3'),
+    ('(pad.sony == 5 && id == 0x05)',
+     '((pad.sony == 5 || pad.sony == 6) && id == 0x05)',
+     '(pad.sony == 5 || pad.sony == 6) && id == 0x05'),
+    ('(pad.sony == 5 && id == 0x09)',
+     '((pad.sony == 5 || pad.sony == 6) && id == 0x09)',
+     '(pad.sony == 5 || pad.sony == 6) && id == 0x09'),
+    ('  } else if (pad.sony == 5 && id == 0x20) {',
+     '  } else if ((pad.sony == 5 || pad.sony == 6) && id == 0x20) {',
+     '(pad.sony == 5 || pad.sony == 6) && id == 0x20'),
+    ('  } else if (pad.sony == 5 && data[0] == 0x02) {',
+     '  } else if ((pad.sony == 5 || pad.sony == 6) && data[0] == 0x02) {',
+     '(pad.sony == 5 || pad.sony == 6) && data[0] == 0x02'),
+    ('makedev(DECK_HIDRAW_MAJOR, sony == 4 ? DS4_HIDRAW_MINOR : DUALSENSE_HIDRAW_MINOR)',
+     'makedev(DECK_HIDRAW_MAJOR, sony == 4 ? DS4_HIDRAW_MINOR : sony == 6 ? DUALSENSE_EDGE_HIDRAW_MINOR : DUALSENSE_HIDRAW_MINOR)',
+     '? DUALSENSE_EDGE_HIDRAW_MINOR : DUALSENSE_HIDRAW_MINOR)'),
+    ('                       : device.sony == 5 ? DUALSENSE_HIDRAW_MINOR',
+     '                       : device.sony == 6 ? DUALSENSE_EDGE_HIDRAW_MINOR\n'
+     '                       : device.sony == 5 ? DUALSENSE_HIDRAW_MINOR',
+     'device.sony == 6 ? DUALSENSE_EDGE_HIDRAW_MINOR'),
+    ('static constexpr const char *DUALSENSE_DEVPATH = "/devices/droiddeck/usb5/5-1:1.3/0003:054C:0CE6.0006/hidraw/hidraw21";',
+     'static constexpr const char *DUALSENSE_DEVPATH = "/devices/droiddeck/usb5/5-1:1.3/0003:054C:0CE6.0006/hidraw/hidraw21";\n'
+     'static constexpr const char *DUALSENSE_EDGE_DEVPATH = "/devices/droiddeck/usb6/6-1:1.3/0003:054C:0DF2.0007/hidraw/hidraw22";',
+     'DUALSENSE_EDGE_DEVPATH'),
+    ('  if (type == PAD_TYPE_STEAM)\n    return inject_uevent(action, TRITON_PAD_DEVPATH',
+     '  if (type == PAD_TYPE_DUALSENSE_EDGE)\n'
+     '    return inject_uevent(action, DUALSENSE_EDGE_DEVPATH, "hidraw", DUALSENSE_EDGE_HIDRAW_PATH, DECK_HIDRAW_MAJOR,\n'
+     '                         DUALSENSE_EDGE_HIDRAW_MINOR);\n'
+     '  if (type == PAD_TYPE_STEAM)\n    return inject_uevent(action, TRITON_PAD_DEVPATH',
+     'type == PAD_TYPE_DUALSENSE_EDGE)'),
+    ('       : type == PAD_TYPE_DUALSENSE ? DUALSENSE_HIDRAW_MINOR',
+     '       : type == PAD_TYPE_DUALSENSE ? DUALSENSE_HIDRAW_MINOR\n'
+     '       : type == PAD_TYPE_DUALSENSE_EDGE ? DUALSENSE_EDGE_HIDRAW_MINOR',
+     'type == PAD_TYPE_DUALSENSE_EDGE ? DUALSENSE_EDGE_HIDRAW_MINOR'),
+    ('                                 "DualShock 4", "DualSense"};',
+     '                                 "DualShock 4", "DualSense", "DualSense Edge"};',
+     '"DualSense", "DualSense Edge"}'),
+    ('kNames[was % 5]',
+     'kNames[was % 6]',
+     'kNames[was % 6]'),
+])
+sys.stdout.write("OK\n")
+PY
+  then ok "DualSense Edge pad type (separate, native back buttons)"
+  else die "Edge patch failed: an upstream anchor moved (see ANCHOR-MISS above). Re-anchor step 9."
+  fi
+else
+  warn "fakeinput_steam.cpp / SteamDeckPad.kt / FakeInputWriter.java not found (skipping Edge pad type)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
