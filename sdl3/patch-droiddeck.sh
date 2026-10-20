@@ -226,5 +226,20 @@ YML
   fi
 fi
 
+# ---------- 8. RumbleComponent: route rumble to the bridged controller (not the phone) ----------
+RC="$DD/app/src/main/java/com/droiddeck/launcher/session/RumbleComponent.kt"
+if [ -f "$RC" ]; then
+  if grep -q "DualSenseBridge.isBridgedSlot" "$RC"; then
+    skip "RumbleComponent bridge routing"
+  elif grep -q "if (!enabled) return" "$RC"; then
+    sed -i '/if (!enabled) return/a\        if (com.droiddeck.launcher.input.DualSenseBridge.isBridgedSlot(slot)) { com.droiddeck.launcher.input.DualSenseBridge.rumble(slot, strong shr 8, weak shr 8); return }' "$RC"
+    grep -q "DualSenseBridge.isBridgedSlot" "$RC" && ok "RumbleComponent bridge routing" || warn "RumbleComponent hook NOT inserted"
+  else
+    warn "RumbleComponent: add a DualSenseBridge.isBridgedSlot(slot) check at the top of buzz()"
+  fi
+else
+  warn "RumbleComponent.kt not found (skipping rumble routing)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
