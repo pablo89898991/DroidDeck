@@ -103,6 +103,7 @@ object DualSenseBridge {
     private var sepMask = 0
     private val sepAxes = FloatArray(6)
     private var sepApplyMs = 0L
+    private var lastPadType = 0
     private var lastSepControls = -1
     private val lastSepPads = ShortArray(4)
     private val lastSepPressure = ShortArray(2)
@@ -197,6 +198,16 @@ object DualSenseBridge {
         }
         if (sepVid != 0 && sepMs != 0L && now - sepMs < 1000L &&
             dev.vendorId == sepVid && dev.productId == sepPid) return true
+        return false
+    }
+
+    /** True when DroidDeck player [deckSlot] is currently driven by a bridge controller (for rumble routing). */
+    @JvmStatic
+    fun isBridgedSlot(deckSlot: Int): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        for (i in 0 until SLOTS) {
+            if (ddSlot[i] == deckSlot && frameMsS[i] != 0L && now - frameMsS[i] < 1000L) return true
+        }
         return false
     }
 
@@ -336,8 +347,8 @@ object DualSenseBridge {
     private fun onFrame(b: Bundle) {
         val slot = b.getInt("slot", 0).coerceIn(0, SLOTS - 1)
         if (slot != 0) { onExtraFrame(slot, b); return }
-        if (b.getInt("sep", 0) == 1) { onSeparateFrame(b); return }
-        if (sepSlot > 0) releaseSep()   // mode switched off: hand the DualSense back to the Deck pad
+        val pt = b.getInt("ptype", 0)
+        if (pt != lastPadType) { lastPadType = pt; FakeInputWriter.setPadType(pt) }  // Deck / DualSense / DS4
         val p = pad ?: return
         frameMsS[0] = SystemClock.elapsedRealtime()
         vidS[0] = b.getInt("vid"); pidS[0] = b.getInt("pid")
@@ -462,7 +473,7 @@ object DualSenseBridge {
     /** Neutral state: called when the bridge disconnects so nothing stays stuck. */
     private fun release() {
         frameMsS[0] = 0L
-        if (sepSlot > 0) releaseSep()
+        if (lastPadType != 0) { lastPadType = 0; FakeInputWriter.setPadType(0) }
         for (k in 1 until SLOTS) padGone(k)
         val p = pad ?: return
         lastMask = 0
