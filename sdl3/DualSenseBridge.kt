@@ -155,13 +155,39 @@ object DualSenseBridge {
     }
 
     /** Forward game rumble (0..255 each) to the physical controller of player 1. */
-    @JvmStatic
-    fun rumble(strong: Int, weak: Int) = rumble(0, strong, weak)
+    // Per-bridge-slot pending auto-stop. The bridge's rumble is level-based (stays on until set to 0),
+    // so we must stop it ourselves after the effect's duration — exactly as RumbleComponent does with its
+    // one-shots. Without this a single "ping" (one 2000 ms buzz) would rumble the controller forever.
+    private val rumbleTimer = Handler(worker.looper)
+    private val rumbleStop = arrayOfNulls<Runnable>(SLOTS)
+    private const val RUMBLE_HOLD_MS = 0xFFFF   // matches RumbleComponent.HOLD_MS
 
-    /** Rumble for a DroidDeck player slot (0 = player 1). */
     @JvmStatic
-    fun rumble(deckSlot: Int, strong: Int, weak: Int) {
-        val bridgeSlot = (0 until SLOTS).firstOrNull { ddSlot[it] == deckSlot } ?: return
+    fun rumble(strong: Int, weak: Int) = rumble(0, strong, weak, RUMBLE_HOLD_MS)
+
+    @JvmStatic
+    fun rumble(deckSlot: Int, strong: Int, weak: Int) = rumble(deckSlot, strong, weak, RUMBLE_HOLD_MS)
+
+    /**
+     * Rumble for a DroidDeck player slot (0 = player 1), honoring the effect duration [ms].
+     * HOLD effects (0xFFFF) and gameplay buzzes expire after a short window and are refreshed by the
+     * next buzz; a one-shot (e.g. the controller "ping") plays for its own duration and then stops.
+     */
+    @JvmStatic
+    fun rumble(deckSlot: Int, strong: Int, weak: Int, ms: Int) {
+        rumbleTimer.post {
+            val bridgeSlot = (0 until SLOTS).firstOrNull { ddSlot[it] == deckSlot } ?: return@post
+            rumbleStop[bridgeSlot]?.let { rumbleTimer.removeCallbacks(it); rumbleStop[bridgeSlot] = null }
+            sendRumble(bridgeSlot, strong, weak)
+            if (strong == 0 && weak == 0) return@post
+            val hold = if (ms == RUMBLE_HOLD_MS || ms <= 0) 2000L else ms.toLong().coerceIn(1L, 5000L)
+            val stop = Runnable { sendRumble(bridgeSlot, 0, 0); rumbleStop[bridgeSlot] = null }
+            rumbleStop[bridgeSlot] = stop
+            rumbleTimer.postDelayed(stop, hold)
+        }
+    }
+
+    private fun sendRumble(bridgeSlot: Int, strong: Int, weak: Int) {
         send(Message.obtain(null, MSG_OUTPUT).apply {
             data = Bundle().apply {
                 putInt("slot", bridgeSlot)
