@@ -344,11 +344,22 @@ object DualSenseBridge {
         lastSepControls = -1; lastSepPads.fill(0); lastSepPressure.fill(0)
     }
 
+    /**
+     * Switch the emulated controller type exactly the way DroidDeck's own QAM does: first show the
+     * right hidraw node (creates /sys/class/hidraw symlink, removes the others) so Steam can enumerate
+     * it, THEN flip the shared pad_type. Without showPad() setPadType alone only changes the report
+     * format, so Steam never sees the new device and keeps the Steam Deck pad.
+     */
+    private fun applyPadType(pt: Int) {
+        try { com.droiddeck.launcher.session.SteamDeckPad.showPad(pt) } catch (t: Throwable) { }
+        FakeInputWriter.setPadType(pt)
+    }
+
     private fun onFrame(b: Bundle) {
         val slot = b.getInt("slot", 0).coerceIn(0, SLOTS - 1)
         if (slot != 0) { onExtraFrame(slot, b); return }
         val pt = b.getInt("ptype", 0)
-        if (pt != lastPadType) { lastPadType = pt; FakeInputWriter.setPadType(pt) }  // Deck / DualSense / DS4
+        if (pt != lastPadType) { lastPadType = pt; applyPadType(pt) }  // Deck / DualSense / DS4
         val p = pad ?: return
         frameMsS[0] = SystemClock.elapsedRealtime()
         vidS[0] = b.getInt("vid"); pidS[0] = b.getInt("pid")
@@ -473,7 +484,7 @@ object DualSenseBridge {
     /** Neutral state: called when the bridge disconnects so nothing stays stuck. */
     private fun release() {
         frameMsS[0] = 0L
-        if (lastPadType != 0) { lastPadType = 0; FakeInputWriter.setPadType(0) }
+        if (lastPadType != 0) { lastPadType = 0; applyPadType(0) }
         for (k in 1 until SLOTS) padGone(k)
         val p = pad ?: return
         lastMask = 0
