@@ -88,6 +88,25 @@ object DualSenseBridge {
     private val lastTouchKey = intArrayOf(-1, -1)  // [left, right]
     private var clickSide = -1                     // -1 none, 0 left, 1 right
 
+    // DeckControls bit layout (those constants are private over there)
+    private const val DC_LEFT_TOUCH = 16
+    private const val DC_RIGHT_TOUCH = 32
+    private const val DC_LEFT_CLICK = 64
+    private const val DC_RIGHT_CLICK = 128
+
+    // Separate-controller mode: the DualSense becomes its OWN DroidDeck controller slot (its own entry in Steam),
+    // with full back buttons, both trackpads and gyro, instead of driving the Steam Deck pad.
+    private var sepSlot = -1
+    private var sepMs = 0L
+    private var sepVid = 0
+    private var sepPid = 0
+    private var sepMask = 0
+    private val sepAxes = FloatArray(6)
+    private var sepApplyMs = 0L
+    private var lastSepControls = -1
+    private val lastSepPads = ShortArray(4)
+    private val lastSepPressure = ShortArray(2)
+
     private val inbox = Messenger(object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(m: Message) {
             when (m.what) {
@@ -175,6 +194,8 @@ object DualSenseBridge {
             if (vidS[i] != 0 && frameMsS[i] != 0L && now - frameMsS[i] < 1000L &&
                 dev.vendorId == vidS[i] && dev.productId == pidS[i]) return true
         }
+        if (sepVid != 0 && sepMs != 0L && now - sepMs < 1000L &&
+            dev.vendorId == sepVid && dev.productId == sepPid) return true
         return false
     }
 
@@ -229,9 +250,93 @@ object DualSenseBridge {
         }
     }
 
+    private fun axisS(v: Float): Short = (v.coerceIn(-1f, 1f) * 32767f).toInt().toShort()
+
+    /** The DualSense as its own full-featured DroidDeck controller (separate Steam entry). */
+    private fun onSeparateFrame(b: Bundle) {
+        val p = pad ?: return
+        val now = SystemClock.elapsedRealtime()
+        sepMs = now
+        sepVid = b.getInt("vid"); sepPid = b.getInt("pid")
+        if (sepSlot <= 0) {
+            sepSlot = p.claimBridgeSlot()
+            if (sepSlot <= 0) return                 // no free DroidDeck slot
+            lastSepControls = -1
+        }
+        val mask = b.getInt("mask")
+        val ax = floatArrayOf(
+            stick(b.getInt("lx")), stick(b.getInt("ly")), stick(b.getInt("rx")), stick(b.getInt("ry")),
+            b.getInt("l2") / 255f, b.getInt("r2") / 255f,
+        )
+        val buttonsChanged = mask != sepMask
+        val axesChanged = !ax.contentEquals(sepAxes)
+        if (buttonsChanged || (axesChanged && now - sepApplyMs >= MIN_AXIS_INTERVAL_MS)) {
+            sepMask = mask
+            ax.copyInto(sepAxes)
+            sepApplyMs = now
+            p.applyExternalSlot(sepSlot, { s: PadState -> fill(s, mask, ax) }, buttonsChanged)
+        }
+
+        // back buttons + trackpads + clicks -> this slot's Deck controls
+        var controls = 0
+        if (((mask shr 19) and 1) != 0) controls = controls or DeckControls.L4
+        if (((mask shr 20) and 1) != 0) controls = controls or DeckControls.R4
+        if (((mask shr 21) and 1) != 0) controls = controls or DeckControls.L5
+        if (((mask shr 22) and 1) != 0) controls = controls or DeckControls.R5
+        val pads = ShortArray(4)
+        val padL = b.getFloatArray("padL")
+        val padR = b.getFloatArray("padR")
+        if (padL != null && padL.size >= 3 && padL[0] > 0.5f) {
+            val xy = orientPad(padL[1], padL[2]); controls = controls or DC_LEFT_TOUCH
+            pads[0] = axisS(xy[0]); pads[1] = axisS(xy[1])
+        }
+        if (padR != null && padR.size >= 3 && padR[0] > 0.5f) {
+            val xy = orientPad(padR[1], padR[2]); controls = controls or DC_RIGHT_TOUCH
+            pads[2] = axisS(xy[0]); pads[3] = axisS(xy[1])
+        }
+        val pressure = ShortArray(2)
+        when (b.getInt("padClick", -1)) {
+            0 -> { controls = controls or DC_LEFT_CLICK; pressure[0] = Short.MAX_VALUE }
+            1 -> { controls = controls or DC_RIGHT_CLICK; pressure[1] = Short.MAX_VALUE }
+        }
+        if (controls != lastSepControls || !pads.contentEquals(lastSepPads) || !pressure.contentEquals(lastSepPressure)) {
+            FakeInputWriter.writeDeckControls(sepSlot, controls, pads, pressure)
+            lastSepControls = controls
+            pads.copyInto(lastSepPads)
+            pressure.copyInto(lastSepPressure)
+        }
+
+        val g = b.getFloatArray("gyro")
+        val a = b.getFloatArray("accel")
+        if (g != null && a != null) {
+            FakeInputWriter.writeMotion(sepSlot, shorts(a, ACCEL_LSB_PER_G, ACCEL_SIGN), shorts(g, GYRO_LSB_PER_DPS * GYRO_GAIN, GYRO_SIGN))
+        }
+    }
+
+    private fun orientPad(x0: Float, y0: Float): FloatArray {
+        var x = x0; var y = y0
+        if (TOUCH_SWAP) { val t = x; x = y; y = t }
+        if (TOUCH_INV_X) x = -x
+        if (TOUCH_INV_Y) y = -y
+        return floatArrayOf(x, y)
+    }
+
+    private fun releaseSep() {
+        val p = pad
+        if (p != null && sepSlot > 0) {
+            FakeInputWriter.writeDeckControls(sepSlot, 0, ShortArray(4), ShortArray(2))
+            p.applyExternalSlot(sepSlot, { s: PadState -> fill(s, 0, FloatArray(6)) }, false)
+            p.releaseBridgeSlot(sepSlot)
+        }
+        sepSlot = -1; sepMs = 0L; sepVid = 0; sepPid = 0; sepMask = 0; sepAxes.fill(0f)
+        lastSepControls = -1; lastSepPads.fill(0); lastSepPressure.fill(0)
+    }
+
     private fun onFrame(b: Bundle) {
         val slot = b.getInt("slot", 0).coerceIn(0, SLOTS - 1)
         if (slot != 0) { onExtraFrame(slot, b); return }
+        if (b.getInt("sep", 0) == 1) { onSeparateFrame(b); return }
+        if (sepSlot > 0) releaseSep()   // mode switched off: hand the DualSense back to the Deck pad
         val p = pad ?: return
         frameMsS[0] = SystemClock.elapsedRealtime()
         vidS[0] = b.getInt("vid"); pidS[0] = b.getInt("pid")
@@ -356,6 +461,7 @@ object DualSenseBridge {
     /** Neutral state: called when the bridge disconnects so nothing stays stuck. */
     private fun release() {
         frameMsS[0] = 0L
+        if (sepSlot > 0) releaseSep()
         for (k in 1 until SLOTS) padGone(k)
         val p = pad ?: return
         lastMask = 0
