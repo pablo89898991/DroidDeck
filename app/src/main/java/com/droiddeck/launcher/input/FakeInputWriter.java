@@ -88,6 +88,7 @@ public class FakeInputWriter {
     public static final int PAD_TYPE_XBOX = 2;
     public static final int PAD_TYPE_DS4 = 3;
     public static final int PAD_TYPE_DUALSENSE = 4;
+    public static final int PAD_TYPE_DUALSENSE_EDGE = 5;
     private static volatile int padType = -1;
     private static volatile boolean tritonConnected = false;
     private static final int TRITON_OFFSET = RING_SIZE + 64;

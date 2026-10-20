@@ -1263,7 +1263,7 @@ static bool fake_deck_enabled() {
 }
 
 static constexpr uint32_t PAD_TYPE_DECK = 0, PAD_TYPE_STEAM = 1, PAD_TYPE_XBOX = 2, PAD_TYPE_DS4 = 3,
-                          PAD_TYPE_DUALSENSE = 4, PAD_TYPE_LAST = PAD_TYPE_DUALSENSE;
+                          PAD_TYPE_DUALSENSE = 4, PAD_TYPE_DUALSENSE_EDGE = 5, PAD_TYPE_LAST = PAD_TYPE_DUALSENSE_EDGE;
 static constexpr uint32_t PAD_TYPE_SET = 0x80000000u;
 
 __attribute__((visibility("hidden"))) static uint32_t session_pad_type() {
@@ -1375,12 +1375,14 @@ __attribute__((visibility("hidden"))) static bool is_deck_hidraw_path(const char
 
 static constexpr const char *DS4_HIDRAW_PATH = "/dev/hidraw20";
 static constexpr const char *DUALSENSE_HIDRAW_PATH = "/dev/hidraw21";
-static constexpr unsigned int DS4_HIDRAW_MINOR = 20, DUALSENSE_HIDRAW_MINOR = 21;
+static constexpr unsigned int DS4_HIDRAW_MINOR = 20, DUALSENSE_HIDRAW_MINOR = 21, DUALSENSE_EDGE_HIDRAW_MINOR = 22;
+static constexpr const char *DUALSENSE_EDGE_HIDRAW_PATH = "/dev/hidraw22";
 
 __attribute__((visibility("hidden"))) static int sony_pad_path(const char *pathname) {
   if (!pathname || !fake_deck_enabled() || strncmp(pathname, "/dev/hidraw2", 12)) return 0;
   if (!strcmp(pathname, DS4_HIDRAW_PATH)) return live_pad_type() == PAD_TYPE_DS4 ? 4 : 0;
   if (!strcmp(pathname, DUALSENSE_HIDRAW_PATH)) return live_pad_type() == PAD_TYPE_DUALSENSE ? 5 : 0;
+  if (!strcmp(pathname, DUALSENSE_EDGE_HIDRAW_PATH)) return live_pad_type() == PAD_TYPE_DUALSENSE_EDGE ? 6 : 0;
   return 0;
 }
 
@@ -1540,6 +1542,16 @@ build_sony_report(uint8_t *report, uint8_t model, uint32_t packet, uint64_t elap
                       (buttons & 256 ? 0x40 : 0) | (buttons & 512 ? 0x80 : 0);
   bool click = extras.controls & (DECK_EXTRA_LPAD_CLICK | DECK_EXTRA_RPAD_CLICK);
   uint8_t system = (buttons & 1024 ? 0x01 : 0) | (click ? 0x02 : 0);
+  // DualSense Edge extra buttons: SDL/Steam read all four from this byte on PID 0x0df2 --
+  //   0x10 left Fn, 0x20 right Fn, 0x40 left back paddle, 0x80 right back paddle.
+  // model 6 == the Edge node; plain DualSense (5) and DS4 (4) are left untouched. Deck grips map 1:1:
+  //   L4 -> left paddle, R4 -> right paddle, L5 -> left Fn, R5 -> right Fn.
+  if (model == 6) {
+    if (extras.controls & DECK_EXTRA_L4) system |= 0x40;
+    if (extras.controls & DECK_EXTRA_R4) system |= 0x80;
+    if (extras.controls & DECK_EXTRA_L5) system |= 0x10;
+    if (extras.controls & DECK_EXTRA_R5) system |= 0x20;
+  }
   uint8_t left_trigger = static_cast<uint8_t>(std::max(0, std::min(255, axes[5])));
   uint8_t right_trigger = static_cast<uint8_t>(std::max(0, std::min(255, axes[4])));
   int16_t gyro[3] = {extras.gyro[0], extras.gyro[2], static_cast<int16_t>(-extras.gyro[1])};
@@ -1586,7 +1598,7 @@ __attribute__((visibility("hidden"))) static void *sony_report_thread(void *arg)
   auto *holder = static_cast<std::shared_ptr<DeckHidraw> *>(arg);
   std::shared_ptr<DeckHidraw> self = *holder;
   delete holder;
-  uint32_t type = self->sony == 4 ? PAD_TYPE_DS4 : PAD_TYPE_DUALSENSE;
+  uint32_t type = self->sony == 4 ? PAD_TYPE_DS4 : self->sony == 6 ? PAD_TYPE_DUALSENSE_EDGE : PAD_TYPE_DUALSENSE;
   uint32_t packet = 0;
   SnapshotState snap;
   uint32_t buttons = 0;
@@ -1613,7 +1625,7 @@ __attribute__((visibility("hidden"))) static void *sony_report_thread(void *arg)
 }
 
 __attribute__((visibility("hidden"))) static int open_deck_hidraw(int flags, uint8_t sony = 0) {
-  const char *path = sony == 4 ? DS4_HIDRAW_PATH : sony == 5 ? DUALSENSE_HIDRAW_PATH : DECK_HIDRAW_PATH;
+  const char *path = sony == 4 ? DS4_HIDRAW_PATH : sony == 5 ? DUALSENSE_HIDRAW_PATH : sony == 6 ? DUALSENSE_EDGE_HIDRAW_PATH : DECK_HIDRAW_PATH;
   static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
   if (!process_is_steam_client()) {
     Logger::log("deck: %s refused: not the Steam client\n", path);
@@ -1677,7 +1689,7 @@ __attribute__((visibility("hidden"))) static int open_deck_hidraw(int flags, uin
   }
   pthread_detach(thread);
   Logger::log("deck: %s opened as fd %d%s\n", path, pair[0],
-              sony == 4 ? " (a DualShock 4)" : sony == 5 ? " (a DualSense)" : "");
+              sony == 4 ? " (a DualShock 4)" : sony == 5 ? " (a DualSense)" : sony == 6 ? " (a DualSense Edge)" : "");
   return pair[0];
 }
 
@@ -2168,6 +2180,7 @@ static constexpr const char *TRITON_PAD_DEVPATH = "/devices/droiddeck/usb3/3-1:1
 static constexpr const char *PAD_EVDEV_DEVPATH = "/devices/virtual/input/droiddeck0/event0";
 static constexpr const char *DS4_DEVPATH = "/devices/droiddeck/usb4/4-1:1.3/0003:054C:09CC.0005/hidraw/hidraw20";
 static constexpr const char *DUALSENSE_DEVPATH = "/devices/droiddeck/usb5/5-1:1.3/0003:054C:0CE6.0006/hidraw/hidraw21";
+static constexpr const char *DUALSENSE_EDGE_DEVPATH = "/devices/droiddeck/usb6/6-1:1.3/0003:054C:0DF2.0007/hidraw/hidraw22";
 static constexpr const char *TRITON_DEVPATH = "/devices/droiddeck/bluetooth/0005:28DE:1303.0003/hidraw/hidraw18";
 
 __attribute__((visibility("hidden"))) static int pad_type_uevent(uint32_t type, const char *action) {
@@ -2178,6 +2191,9 @@ __attribute__((visibility("hidden"))) static int pad_type_uevent(uint32_t type, 
   if (type == PAD_TYPE_DUALSENSE)
     return inject_uevent(action, DUALSENSE_DEVPATH, "hidraw", DUALSENSE_HIDRAW_PATH, DECK_HIDRAW_MAJOR,
                          DUALSENSE_HIDRAW_MINOR);
+  if (type == PAD_TYPE_DUALSENSE_EDGE)
+    return inject_uevent(action, DUALSENSE_EDGE_DEVPATH, "hidraw", DUALSENSE_EDGE_HIDRAW_PATH, DECK_HIDRAW_MAJOR,
+                         DUALSENSE_EDGE_HIDRAW_MINOR);
   if (type == PAD_TYPE_STEAM)
     return inject_uevent(action, TRITON_PAD_DEVPATH, "hidraw", TRITON_PAD_HIDRAW_PATH, TRITON_HIDRAW_MAJOR,
                          TRITON_PAD_HIDRAW_MINOR);
@@ -2199,15 +2215,16 @@ __attribute__((visibility("hidden"))) static void poke_hidraw_watchers(unsigned 
 __attribute__((visibility("hidden"))) static unsigned pad_type_minor(uint32_t type) {
   return type == PAD_TYPE_DS4 ? DS4_HIDRAW_MINOR
        : type == PAD_TYPE_DUALSENSE ? DUALSENSE_HIDRAW_MINOR
+       : type == PAD_TYPE_DUALSENSE_EDGE ? DUALSENSE_EDGE_HIDRAW_MINOR
        : type == PAD_TYPE_STEAM ? TRITON_PAD_HIDRAW_MINOR : DECK_HIDRAW_MINOR;
 }
 
 __attribute__((visibility("hidden"))) static void *pad_type_thread(void *) {
   static const char *kNames[] = {"Steam Deck controller", "Steam Controller", "Xbox 360 controller",
-                                 "DualShock 4", "DualSense"};
+                                 "DualShock 4", "DualSense", "DualSense Edge"};
   uint32_t was = live_pad_type();
   bool paired = fake_triton_enabled() && triton_connected();
-  Logger::log("pad: a %s at start%s\n", kNames[was % 5], paired ? ", the paired Steam Controller connected" : "");
+  Logger::log("pad: a %s at start%s\n", kNames[was % 6], paired ? ", the paired Steam Controller connected" : "");
   for (;;) {
     struct timespec interval = {0, 50 * 1000 * 1000};
     nanosleep(&interval, nullptr);
@@ -2456,11 +2473,11 @@ __attribute__((visibility("hidden"))) static int sony_feature(const DeckHidraw &
   uint8_t reply[64] = {};
   reply[0] = id;
   size_t length = size;
-  if ((pad.sony == 4 && id == 0x02) || (pad.sony == 5 && id == 0x05)) {
+  if ((pad.sony == 4 && id == 0x02) || ((pad.sony == 5 || pad.sony == 6) && id == 0x05)) {
     put_sony_calibration(reply);
-  } else if ((pad.sony == 4 && (id == 0x12 || id == 0x81)) || (pad.sony == 5 && id == 0x09)) {
+  } else if ((pad.sony == 4 && (id == 0x12 || id == 0x81)) || ((pad.sony == 5 || pad.sony == 6) && id == 0x09)) {
     for (int i = 0; i < 6; i++) reply[1 + i] = SONY_MAC[5 - i];
-  } else if (pad.sony == 5 && id == 0x20) {
+  } else if ((pad.sony == 5 || pad.sony == 6) && id == 0x20) {
     reply[44] = 0x30;
     reply[45] = 0x04;
   }
@@ -2477,7 +2494,7 @@ __attribute__((visibility("hidden"))) static void sony_output(const DeckHidraw &
     if (!(data[1] & 0x01)) return;
     weak = data[4];
     strong = data[5];
-  } else if (pad.sony == 5 && data[0] == 0x02) {
+  } else if ((pad.sony == 5 || pad.sony == 6) && data[0] == 0x02) {
     if (!(data[1] & 0x03)) return;
     weak = data[3];
     strong = data[4];
@@ -2510,14 +2527,14 @@ __attribute__((visibility("hidden"))) static int ioctl_sony(DeckHidraw &pad, ioc
       uint32_t bustype;
       int16_t vendor;
       int16_t product;
-    } info = {BUS_USB, static_cast<int16_t>(0x054c), static_cast<int16_t>(pad.sony == 4 ? 0x09cc : 0x0ce6)};
+    } info = {BUS_USB, static_cast<int16_t>(0x054c), static_cast<int16_t>(pad.sony == 4 ? 0x09cc : pad.sony == 6 ? 0x0df2 : 0x0ce6)};
     memcpy(argp, &info, sizeof(info));
     return 0;
   }
   case 0x04:
     return copy_ioctl_string(op, argp, pad.sony == 4 ? "Sony Interactive Entertainment Wireless Controller"
-                                                     : "Sony Interactive Entertainment DualSense Wireless Controller");
-  case 0x05: return copy_ioctl_string(op, argp, pad.sony == 4 ? "usb-droiddeck-4/input3" : "usb-droiddeck-5/input3");
+                                                     : pad.sony == 6 ? "Sony Interactive Entertainment DualSense Edge Wireless Controller" : "Sony Interactive Entertainment DualSense Wireless Controller");
+  case 0x05: return copy_ioctl_string(op, argp, pad.sony == 4 ? "usb-droiddeck-4/input3" : pad.sony == 6 ? "usb-droiddeck-6/input3" : "usb-droiddeck-5/input3");
   case 0x08: return copy_ioctl_string(op, argp, "5e:43:4b:44:44:02");
   case 0x06:
     return static_cast<int>(_IOC_SIZE(op));
@@ -3065,7 +3082,7 @@ static int fake_stat_path(const char *pathname, S *statbuf, Real real) {
   if (int sony = sony_pad_path(pathname)) {
     memset(statbuf, 0, sizeof(*statbuf));
     statbuf->st_mode = S_IFCHR | 0666;
-    statbuf->st_rdev = makedev(DECK_HIDRAW_MAJOR, sony == 4 ? DS4_HIDRAW_MINOR : DUALSENSE_HIDRAW_MINOR);
+    statbuf->st_rdev = makedev(DECK_HIDRAW_MAJOR, sony == 4 ? DS4_HIDRAW_MINOR : sony == 6 ? DUALSENSE_EDGE_HIDRAW_MINOR : DUALSENSE_HIDRAW_MINOR);
     return 0;
   }
   if (is_triton_hidraw_path(pathname) || is_triton_pad_path(pathname)) {
@@ -3123,6 +3140,7 @@ static int fake_stat_fd(int fd, S *buf, Real real) {
     const auto &device = *deck_map()[fd];
     unsigned int minor = device.touch ? TOUCH_HIDRAW_MINOR
                        : device.sony == 4 ? DS4_HIDRAW_MINOR
+                       : device.sony == 6 ? DUALSENSE_EDGE_HIDRAW_MINOR
                        : device.sony == 5 ? DUALSENSE_HIDRAW_MINOR
                        : device.emulated ? TRITON_PAD_HIDRAW_MINOR
                        : device.triton ? TRITON_HIDRAW_MINOR : DECK_HIDRAW_MINOR;
