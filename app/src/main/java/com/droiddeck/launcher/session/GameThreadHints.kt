@@ -60,7 +60,11 @@ object GameThreadHints {
     fun start(context: Context): String {
         if (!SessionPrefs.gameThreadHints(context)) return "game thread hints: off"
         // Measured on the Odin 3 (CQ8725S) only; another HAL may boost differently, or not at all.
-        if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL != "CQ8725S") return "game thread hints: Odin 3 only"
+        if (Build.VERSION.SDK_INT < 31) return "game thread hints: needs Android 12+"
+        // ADPF boosting is a pure scheduling hint (it cannot change how a game runs), so allow it on
+        // any Qualcomm SoC -- the same WALT scheduler / power-HAL family it was tuned on (Odin 3).
+        val qualcomm = Build.SOC_MANUFACTURER == "QTI" || Build.SOC_MODEL.startsWith("SM") || Build.SOC_MODEL == "CQ8725S"
+        if (!qualcomm) return "game thread hints: Qualcomm only (tuned on Odin 3)"
         val hm = context.getSystemService(PerformanceHintManager::class.java)
             ?: return "game thread hints: no PerformanceHintManager"
         val pm = context.getSystemService(PowerManager::class.java)
