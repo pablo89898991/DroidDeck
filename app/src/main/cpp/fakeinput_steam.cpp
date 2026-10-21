@@ -1563,6 +1563,9 @@ build_sony_report(uint8_t *report, uint8_t model, uint32_t packet, uint64_t elap
   int16_t accel[3] = {static_cast<int16_t>(extras.accel[0] / 2), static_cast<int16_t>(extras.accel[2] / 2),
                       static_cast<int16_t>(-extras.accel[1] / 2)};
   bool left = extras.controls & DECK_EXTRA_LPAD_TOUCH, right = extras.controls & DECK_EXTRA_RPAD_TOUCH;
+  { static int dbg__ = -1; int cur__ = (left ? 1 : 0) | (right ? 2 : 0); if (cur__ != dbg__) { dbg__ = cur__;
+    Logger::log("sonytouch L=%d R=%d padL=(%d,%d) padR=(%d,%d)\n", left ? 1 : 0, right ? 1 : 0,
+                (int) extras.pads[0], (int) extras.pads[1], (int) extras.pads[2], (int) extras.pads[3]); } }
   if (model == 4) {
     p[4] = static_cast<uint8_t>(hat | face);
     p[5] = shoulders;
