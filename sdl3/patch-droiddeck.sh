@@ -398,6 +398,14 @@ patch(cpp, [
      '  int px = side * half + (static_cast<int>(x) + 32768) * (half - 1) / 65535;',
      '  int px = (static_cast<int>(x) + 32768) * (SONY_TOUCH_WIDTH - 1) / 65535;',
      'int px = (static_cast<int>(x) + 32768) * (SONY_TOUCH_WIDTH - 1) / 65535;'),
+    # TEMP DIAGNOSTIC: log the Sony touch state on change so we can see whether finger 1 (the right pad)
+    # reaches the report. Remove once the multitouch bug is found.
+    ('  bool left = extras.controls & DECK_EXTRA_LPAD_TOUCH, right = extras.controls & DECK_EXTRA_RPAD_TOUCH;',
+     '  bool left = extras.controls & DECK_EXTRA_LPAD_TOUCH, right = extras.controls & DECK_EXTRA_RPAD_TOUCH;\n'
+     '  { static int dbg__ = -1; int cur__ = (left ? 1 : 0) | (right ? 2 : 0); if (cur__ != dbg__) { dbg__ = cur__;\n'
+     '    Logger::log("sonytouch L=%d R=%d padL=(%d,%d) padR=(%d,%d)\\n", left ? 1 : 0, right ? 1 : 0,\n'
+     '                (int) extras.pads[0], (int) extras.pads[1], (int) extras.pads[2], (int) extras.pads[3]); } }',
+     'sonytouch L=%d'),
 ])
 sys.stdout.write("OK\n")
 PY
