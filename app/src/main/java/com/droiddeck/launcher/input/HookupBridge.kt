@@ -134,12 +134,12 @@ object HookupBridge {
     @Synchronized
     fun add(id: Bundle) {
         val m = map ?: run {
-            Log.w(TAG, "hookup: the bridge handed over a controller but this session has no hook-up file " +
+            note("hookup: the bridge handed over a controller but this session has no hook-up file " +
                 "(DroidDeck build without it, or the session started without the deck pad)")
             return
         }
         val slot = id.getInt("slot", -1)
-        if (slot !in 0 until SLOTS) return
+        if (slot !in 0 until SLOTS) { note("hookup: the bridge handed over slot $slot, which does not exist"); return }
         val base = slotBase(slot)
         val desc = id.getByteArray("desc") ?: ByteArray(0)
         if (present[slot] && (m.getShort(base + S_VENDOR).toInt() and 0xffff) == id.getInt("vid") &&
