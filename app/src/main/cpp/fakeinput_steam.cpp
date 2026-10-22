@@ -1184,8 +1184,9 @@ struct TritonSharedData {
   uint32_t input_length;
   uint8_t input[64];
   uint64_t output_seq;
-  uint32_t output_feature;
-  uint32_t output_length;
+  uint16_t output_feature;
+  uint16_t output_length;
+  uint32_t output_ack;
   uint8_t output[64];
   uint64_t get_request;
   uint64_t get_reply;
@@ -1202,6 +1203,8 @@ static_assert(offsetof(TritonSharedData, report_id) == 16, "Triton report ID off
 static_assert(offsetof(TritonSharedData, input) == 24, "Triton input offset");
 static_assert(offsetof(TritonSharedData, output_seq) == 88, "Triton output sequence offset");
 static_assert(offsetof(TritonSharedData, output_feature) == 96, "Triton output feature offset");
+static_assert(offsetof(TritonSharedData, output_length) == 98, "Triton output length offset");
+static_assert(offsetof(TritonSharedData, output_ack) == 100, "Triton output ack offset");
 static_assert(offsetof(TritonSharedData, output) == 104, "Triton output offset");
 static_assert(offsetof(TritonSharedData, get_request) == 168, "Triton feature request offset");
 static_assert(offsetof(TritonSharedData, get_reply) == 176, "Triton feature reply offset");
@@ -1219,6 +1222,8 @@ static constexpr int TRITON_REPORT_ID_BYTES = 1;
 static constexpr int TRITON_STATE_BYTES = 45;
 static constexpr int TRITON_REPORT_INTERVAL_US = 4000;
 static constexpr int TRITON_FEATURE_TIMEOUT_MS = 500;
+// The app clears output_length once it has taken a report; a writer waits this long for that before overwriting.
+static constexpr int TRITON_OUTPUT_TIMEOUT_MS = 50;
 static constexpr const char *TRITON_NAME = "Steam Controller";
 static constexpr const char *TRITON_SERIAL = "DROIDDECKSC01";
 static const uint8_t kTritonReportDescriptor[] = {
@@ -1563,9 +1568,6 @@ build_sony_report(uint8_t *report, uint8_t model, uint32_t packet, uint64_t elap
   int16_t accel[3] = {static_cast<int16_t>(extras.accel[0] / 2), static_cast<int16_t>(extras.accel[2] / 2),
                       static_cast<int16_t>(-extras.accel[1] / 2)};
   bool left = extras.controls & DECK_EXTRA_LPAD_TOUCH, right = extras.controls & DECK_EXTRA_RPAD_TOUCH;
-  { static int dbg__ = -1; int cur__ = (left ? 1 : 0) | (right ? 2 : 0); if (cur__ != dbg__) { dbg__ = cur__;
-    Logger::log("sonytouch L=%d R=%d padL=(%d,%d) padR=(%d,%d)\n", left ? 1 : 0, right ? 1 : 0,
-                (int) extras.pads[0], (int) extras.pads[1], (int) extras.pads[2], (int) extras.pads[3]); } }
   if (model == 4) {
     p[4] = static_cast<uint8_t>(hat | face);
     p[5] = shoulders;
@@ -2497,19 +2499,35 @@ __attribute__((visibility("hidden"))) static int sony_feature(const DeckHidraw &
 
 __attribute__((visibility("hidden"))) static void sony_output(const DeckHidraw &pad, const uint8_t *data, size_t size) {
   if (!data || size < 6) return;
-  int weak, strong;
+  // sdl3bridge: sony rumble v2
+  static int last_strong = -1, last_weak = -1;
+  static unsigned logged = 0;
+  int weak = 0, strong = 0;
   if (pad.sony == 4 && data[0] == 0x05) {
-    if (!(data[1] & 0x01)) return;
+    if (!(data[1] & 0x01)) return;  // DS4: motors untouched by this report
     weak = data[4];
     strong = data[5];
   } else if ((pad.sony == 5 || pad.sony == 6) && data[0] == 0x02) {
-    if (!(data[1] & 0x03)) return;
-    weak = data[3];
-    strong = data[4];
+    // [1] enable bits1 (0x01 rumble emulation, 0x02 haptics off), [3] right/weak, [4] left/strong,
+    // [39] enable bits3 (0x04 = improved rumble, fw >= 2.24 / Edge). Full state is re-sent every
+    // report, and the bits are cleared once the motors stop: no bits = motors off.
+    bool rumble = (data[1] & 0x03) || (size > 39 && (data[39] & 0x04));
+    if (rumble) {
+      weak = data[3];
+      strong = data[4];
+    }
   } else {
     return;
   }
-  send_vibration(strong * 257, weak * 257, strong || weak ? 2000 : 0, 0);
+  if (strong == last_strong && weak == last_weak) return;  // LED / repeat report: nothing changed
+  if (logged < 40) {
+    logged++;
+    Logger::log("sony: out 0x%02x bits %02x/%02x motors %d/%d\n", data[0], data[1],
+                size > 39 ? data[39] : 0, strong, weak);
+  }
+  last_strong = strong;
+  last_weak = weak;
+  send_vibration(strong * 257, weak * 257, strong || weak ? RUMBLE_HOLD_MS : 0, 0);
 }
 
 __attribute__((visibility("hidden"))) static int ioctl_sony(DeckHidraw &pad, ioctl_request_t op, void *argp) {
@@ -2596,11 +2614,21 @@ __attribute__((visibility("hidden"))) static void triton_queue_output(DeckHidraw
   if (!data || !size || size > 64 || triton.mapping_size < TRITON_SHARED_OFFSET + TRITON_SHARED_BLOCK_SIZE) return;
   auto *shared = reinterpret_cast<TritonSharedData *>(reinterpret_cast<uint8_t *>(triton.ring) + TRITON_SHARED_OFFSET);
   if (__atomic_load_n(&shared->magic, __ATOMIC_ACQUIRE) != TRITON_SHARED_MAGIC) return;
+  static std::mutex one_at_a_time;
+  std::lock_guard<std::mutex> guard(one_at_a_time);
+  for (int waited = 0;
+       static_cast<uint32_t>(__atomic_load_n(&shared->output_seq, __ATOMIC_ACQUIRE)) !=
+           __atomic_load_n(&shared->output_ack, __ATOMIC_ACQUIRE) &&
+       __atomic_load_n(&shared->connected, __ATOMIC_ACQUIRE) != 0 && waited < TRITON_OUTPUT_TIMEOUT_MS * 4;
+       waited++) {
+    struct timespec interval = {0, 250 * 1000L};
+    nanosleep(&interval, nullptr);
+  }
   uint64_t seq = __atomic_load_n(&shared->output_seq, __ATOMIC_RELAXED);
   if (seq & 1) seq++;
   __atomic_store_n(&shared->output_seq, seq + 1, __ATOMIC_RELEASE);
   shared->output_feature = feature ? 1 : 0;
-  shared->output_length = static_cast<uint32_t>(size);
+  shared->output_length = static_cast<uint16_t>(size);
   memcpy(shared->output, data, size);
   if (size < sizeof(shared->output)) memset(shared->output + size, 0, sizeof(shared->output) - size);
   __atomic_thread_fence(__ATOMIC_RELEASE);
