@@ -88,6 +88,7 @@ object DualSenseBridge {
     )
 
     private var appContext: Context? = null
+    @Volatile private var owner: Any? = null
     private var pad: PadBridge? = null
     private var server: Messenger? = null
     private var bound = false
@@ -166,7 +167,14 @@ object DualSenseBridge {
     @Synchronized
     fun attach(context: Context, padBridge: PadBridge): Boolean {
         pad = padBridge
-        if (bound) return true
+        owner = context
+        if (bound) {
+            // A new session screen while the old one is still being torn down (Android recreates it when you
+            // come back from another app): keep the connection, and ask the bridge to resend its state.
+            send(Message.obtain(null, MSG_REGISTER).apply { replyTo = inbox })
+            HookupBridge.note("bridge: new session screen, connection kept, state re-requested")
+            return true
+        }
         val app = context.applicationContext
         appContext = app
         bound = try {
@@ -177,7 +185,18 @@ object DualSenseBridge {
 
     @JvmStatic
     @Synchronized
-    fun detach() {
+    fun detach() = detach(null)
+
+    /** Only the screen that attached last may detach (an old screen's late onDestroy must not cut the new one off). */
+    @JvmStatic
+    @Synchronized
+    fun detach(who: Any?) {
+        if (who != null && who !== owner) {
+            HookupBridge.note("bridge: an old session screen closed; the bridge stays connected")
+            return
+        }
+        HookupBridge.note("bridge: disconnected (session screen closed)")
+        owner = null
         if (bound) {
             send(Message.obtain(null, MSG_UNREGISTER).apply { replyTo = inbox })
             try { appContext?.unbindService(conn) } catch (_: IllegalArgumentException) {}
