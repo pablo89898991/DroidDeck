@@ -24,6 +24,7 @@ permissions:
 
 jobs:
   build:
+    if: github.repository == 'Droid-Deck/droiddeck'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     steps:

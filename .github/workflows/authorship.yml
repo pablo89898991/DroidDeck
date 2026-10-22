@@ -23,6 +23,7 @@ permissions:
 
 jobs:
   validate:
+    if: github.repository == 'Droid-Deck/droiddeck'
     name: Build APK
     runs-on: ubuntu-24.04
     timeout-minutes: 5
