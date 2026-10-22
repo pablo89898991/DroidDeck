@@ -138,9 +138,9 @@ object DualSenseBridge {
                     if (tritonOn) FakeInputWriter.writeTritonState(TRITON_SLOT, m.data.getInt("id"), it)
                 }
                 MSG_TRITON_CONN -> setTriton(m.data.getBoolean("on"), m.data.getString("what") ?: "")
-                MSG_HOOKUP_ADD -> { HookupBridge.add(m.data); startHookupPoll() }
+                MSG_HOOKUP_ADD -> { HookupBridge.add(m.data); startHookupPoll(); updateHookupPad() }
                 MSG_HOOKUP_INPUT -> m.data.getByteArray("data")?.let { HookupBridge.input(m.data.getInt("slot"), it) }
-                MSG_HOOKUP_REMOVE -> HookupBridge.remove(m.data.getInt("slot"))
+                MSG_HOOKUP_REMOVE -> { HookupBridge.remove(m.data.getInt("slot")); updateHookupPad() }
                 MSG_HOOKUP_REPLY -> HookupBridge.reply(m.data.getInt("slot"), m.data.getLong("request"), m.data.getByteArray("data"))
                 MSG_TRITON_FEATURE -> {
                     val request = m.data.getLong("request")
@@ -241,6 +241,25 @@ object DualSenseBridge {
                     })
                 })
             workerHandler.postDelayed(this, HOOKUP_POLL_MS)
+        }
+    }
+
+    // While real controllers are handed to Steam and no bridged gamepad is streaming, DroidDeck's own pad
+    // is withdrawn so the real controller is player 1 in Steam (pad type 7 = none), like on a PC.
+    private var hookupPadHidden = false
+
+    private fun updateHookupPad() {
+        val hide = HookupBridge.anyPresent() && !isActive()
+        if (hide && !hookupPadHidden) {
+            hookupPadHidden = true
+            lastPadType = -1
+            applyPadType(FakeInputWriter.PAD_TYPE_NONE)
+        } else if (!hide && hookupPadHidden) {
+            hookupPadHidden = false
+            val ctx = appContext ?: return
+            val pt = com.droiddeck.launcher.session.SessionPrefs.padType(com.droiddeck.launcher.session.SessionPrefs.steamController(ctx))
+            lastPadType = pt
+            applyPadType(pt)
         }
     }
 
@@ -590,6 +609,7 @@ object DualSenseBridge {
         val slot = b.getInt("slot", 0).coerceIn(0, SLOTS - 1)
         if (slot != 0) { onExtraFrame(slot, b); return }
         val pt = b.getInt("ptype", 0)
+        if (hookupPadHidden) hookupPadHidden = false   // a bridged gamepad needs DroidDeck's pad again
         if (pt != lastPadType) { lastPadType = pt; applyPadType(pt) }  // Deck / DualSense / DS4
         val p = pad ?: return
         frameMsS[0] = SystemClock.elapsedRealtime()
@@ -715,7 +735,8 @@ object DualSenseBridge {
     /** Neutral state: called when the bridge disconnects so nothing stays stuck. */
     private fun release() {
         frameMsS[0] = 0L
-        if (lastPadType != 0) { lastPadType = 0; applyPadType(0) }
+        if (lastPadType != 0 && !hookupPadHidden) { lastPadType = 0; applyPadType(0) }
+        updateHookupPad()
         for (k in 1 until SLOTS) padGone(k)
         val p = pad ?: return
         lastMask = 0

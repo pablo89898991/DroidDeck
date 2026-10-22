@@ -1296,7 +1296,8 @@ static bool fake_deck_enabled() {
 
 static constexpr uint32_t PAD_TYPE_DECK = 0, PAD_TYPE_STEAM = 1, PAD_TYPE_XBOX = 2, PAD_TYPE_DS4 = 3,
                           PAD_TYPE_DUALSENSE = 4, PAD_TYPE_DUALSENSE_EDGE = 5,
-                          PAD_TYPE_STEAM_2015 = 6, PAD_TYPE_LAST = PAD_TYPE_STEAM_2015;
+                          PAD_TYPE_STEAM_2015 = 6,
+                          PAD_TYPE_NONE = 7, PAD_TYPE_LAST = PAD_TYPE_NONE;
 static constexpr uint32_t PAD_TYPE_SET = 0x80000000u;
 
 __attribute__((visibility("hidden"))) static uint32_t session_pad_type() {
@@ -2343,6 +2344,7 @@ static constexpr const char *DUALSENSE_EDGE_DEVPATH = "/devices/droiddeck/usb6/6
 static constexpr const char *TRITON_DEVPATH = "/devices/droiddeck/bluetooth/0005:28DE:1303.0003/hidraw/hidraw18";
 
 __attribute__((visibility("hidden"))) static int pad_type_uevent(uint32_t type, const char *action) {
+  if (type == PAD_TYPE_NONE) return 0;  // sdl3bridge: no pad (real controllers handed to Steam)
   if (type == PAD_TYPE_DECK)
     return inject_uevent(action, DECK_DEVPATH, "hidraw", DECK_HIDRAW_PATH, DECK_HIDRAW_MAJOR, DECK_HIDRAW_MINOR);
   if (type == PAD_TYPE_DS4)
@@ -2384,10 +2386,10 @@ __attribute__((visibility("hidden"))) static unsigned pad_type_minor(uint32_t ty
 __attribute__((visibility("hidden"))) static void *pad_type_thread(void *) {
   static const char *kNames[] = {"Steam Deck controller", "Steam Controller", "Xbox 360 controller",
                                  "DualShock 4", "DualSense", "DualSense Edge",
-                                 "Steam Controller (2015)"};
+                                 "Steam Controller (2015)", "no pad"};
   uint32_t was = live_pad_type();
   bool paired = fake_triton_enabled() && triton_connected();
-  Logger::log("pad: a %s at start%s\n", kNames[was % 7], paired ? ", the paired Steam Controller connected" : "");
+  Logger::log("pad: a %s at start%s\n", kNames[was % 8], paired ? ", the paired Steam Controller connected" : "");
   for (;;) {
     struct timespec interval = {0, 50 * 1000 * 1000};
     nanosleep(&interval, nullptr);
