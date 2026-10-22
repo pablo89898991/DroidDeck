@@ -110,6 +110,7 @@ object HookupBridge {
     private fun slotBase(slot: Int) = HEADER_SIZE + slot * SLOT_SIZE
 
     @JvmStatic fun anyPresent(): Boolean = present.any { it }
+    @JvmStatic fun isPresent(slot: Int): Boolean = slot in 0 until SLOTS && present[slot]
 
     /** True while Steam is handed game rumble (a real controller it drives itself is present). */
     @JvmStatic fun ffToSteam(): Boolean = map != null && (anyPresent() || tritonPassthrough)
