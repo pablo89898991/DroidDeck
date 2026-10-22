@@ -187,6 +187,20 @@ object DualSenseBridge {
     @Synchronized
     fun detach() = detach(null)
 
+    /**
+     * The session screen is closing (Android also does this when you switch apps; a new screen attaches when you
+     * come back). Only its PadBridge is dropped -- the bridge stays connected, so Steam Native Hook-up and the
+     * Steam Controller passthrough keep running until the session ends or DroidDeck is closed.
+     */
+    @JvmStatic
+    @Synchronized
+    fun screenClosed(who: Any?) {
+        if (who !== owner) return
+        HookupBridge.note("bridge: session screen closed; the bridge stays connected until the session ends")
+        owner = null
+        pad = null
+    }
+
     /** Only the screen that attached last may detach (an old screen's late onDestroy must not cut the new one off). */
     @JvmStatic
     @Synchronized
