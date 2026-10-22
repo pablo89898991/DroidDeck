@@ -55,6 +55,11 @@ object DualSenseBridge {
     private const val MSG_HOOKUP_REMOVE = 22
     private const val MSG_HOOKUP_REPLY = 23
     private const val HOOKUP_POLL_MS = 1L
+    private const val MSG_BRIDGE_LOG = 30
+    // Background watchdog (like Steam on a PC: controllers are picked up whenever they appear)
+    private const val MSG_HOOKUP_SYNC = 9      // -> bridge: "send me everything you hand over right now"
+    private const val MSG_HOOKUP_STATE = 24    // <- bridge: "slots": the hook-up slots that are live
+    private const val WATCHDOG_MS = 1500L
     private const val SLOTS = 4
 
     // ---- Tunables (verify on device) ----
@@ -141,6 +146,16 @@ object DualSenseBridge {
                 MSG_TRITON_CONN -> setTriton(m.data.getBoolean("on"), m.data.getString("what") ?: "")
                 MSG_HOOKUP_ADD -> { HookupBridge.add(m.data); startHookupPoll(); updateHookupPad() }
                 MSG_HOOKUP_INPUT -> m.data.getByteArray("data")?.let { HookupBridge.input(m.data.getInt("slot"), it) }
+                MSG_HOOKUP_STATE -> {
+                    val live = m.data.getIntArray("slots") ?: IntArray(0)
+                    for (s in 0 until HookupBridge.SLOTS) if (HookupBridge.isPresent(s) && s !in live) {
+                        HookupBridge.note("hookup: the bridge no longer hands over slot $s; removing it")
+                        HookupBridge.remove(s)
+                    }
+                    if (live.isNotEmpty()) startHookupPoll()
+                    updateHookupPad()
+                }
+                MSG_BRIDGE_LOG -> m.data.getString("text")?.split('\n')?.forEach { HookupBridge.note("sdl3bridge: $it") }
                 MSG_HOOKUP_REMOVE -> { HookupBridge.remove(m.data.getInt("slot")); updateHookupPad() }
                 MSG_HOOKUP_REPLY -> HookupBridge.reply(m.data.getInt("slot"), m.data.getLong("request"), m.data.getByteArray("data"))
                 MSG_TRITON_FEATURE -> {
@@ -168,6 +183,11 @@ object DualSenseBridge {
     fun attach(context: Context, padBridge: PadBridge): Boolean {
         pad = padBridge
         owner = context
+        if (!sessionActive) {
+            sessionActive = true
+            workerHandler.removeCallbacks(watchdog)
+            workerHandler.postDelayed(watchdog, WATCHDOG_MS)
+        }
         if (bound) {
             // A new session screen while the old one is still being torn down (Android recreates it when you
             // come back from another app): keep the connection, and ask the bridge to resend its state.
@@ -209,7 +229,9 @@ object DualSenseBridge {
             HookupBridge.note("bridge: an old session screen closed; the bridge stays connected")
             return
         }
-        HookupBridge.note("bridge: disconnected (session screen closed)")
+        HookupBridge.note("bridge: disconnected (session ended)")
+        sessionActive = false
+        workerHandler.removeCallbacks(watchdog)
         owner = null
         if (bound) {
             send(Message.obtain(null, MSG_UNREGISTER).apply { replyTo = inbox })
@@ -254,11 +276,46 @@ object DualSenseBridge {
         }
     }
 
+    // ---------------- background watchdog ----------------
+    // For the whole session (not just while the session screen is open), like Steam on a PC: reconnect to the
+    // bridge if that connection is gone (bridge restarted, killed, installed late), and ask it every 1.5 s what it
+    // is handing over -- controllers that appeared are added, ones it no longer has are removed, and nothing
+    // changes for ones that are already there. Also keeps DroidDeck's own pad withdrawn while Steam has a real one.
+    @Volatile private var sessionActive = false
+    private var serverLostTicks = 0
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (!sessionActive) return
+            val ctx = appContext
+            if (!bound && ctx != null) {
+                bound = try {
+                    ctx.bindService(Intent(BRIDGE_ACTION).setPackage(BRIDGE_PKG), conn, Context.BIND_AUTO_CREATE)
+                } catch (_: SecurityException) { false }
+                if (bound) HookupBridge.note("bridge: watchdog (re)connecting to the SDL3 bridge")
+            } else if (server != null) {
+                serverLostTicks = 0
+                send(Message.obtain(null, MSG_HOOKUP_SYNC).apply { replyTo = inbox })
+            } else if (bound && ++serverLostTicks >= 4) {
+                // bound but no connection for ~6 s (the bridge app was force-stopped): start over
+                serverLostTicks = 0
+                try { ctx?.unbindService(conn) } catch (_: IllegalArgumentException) {}
+                bound = false
+                HookupBridge.note("bridge: the SDL3 bridge went away; the watchdog will reconnect")
+            }
+            updateHookupPad()
+            workerHandler.postDelayed(this, WATCHDOG_MS)
+        }
+    }
+
     // ---------------- Steam Native Hook-up: Steam -> controller ----------------
     private var hookupPolling = false
+    private var hookupPollTicks = 0
     private val hookupPoll = object : Runnable {
         override fun run() {
             if (!HookupBridge.anyPresent()) { hookupPolling = false; return }
+            // every ~250 ms: keep DroidDeck's own pad withdrawn (also once a bridged gamepad's last frame is
+            // more than a second old -- e.g. right after hook-up was switched back on)
+            if (++hookupPollTicks % 250 == 0) updateHookupPad()
             HookupBridge.poll(
                 { slot, kind, report ->
                     send(Message.obtain(null, MSG_HOOKUP_OUT).apply {
@@ -281,8 +338,18 @@ object DualSenseBridge {
     // is withdrawn so the real controller is player 1 in Steam (pad type 7 = none), like on a PC.
     private var hookupPadHidden = false
 
+    private val padTypeField = runCatching {
+        FakeInputWriter::class.java.getDeclaredField("padType").apply { isAccessible = true }
+    }.getOrNull()
+    private fun currentPadType(): Int = runCatching { padTypeField?.getInt(null) ?: -2 }.getOrDefault(-2)
+
     private fun updateHookupPad() {
         val hide = HookupBridge.anyPresent() && !isActive()
+        if (hide && hookupPadHidden && currentPadType() != FakeInputWriter.PAD_TYPE_NONE) {
+            // something switched DroidDeck's pad back on (e.g. the pad-type menu): withdraw it again
+            HookupBridge.note("hookup: DroidDeck's pad came back while a controller is handed to Steam; withdrawing it again")
+            applyPadType(FakeInputWriter.PAD_TYPE_NONE)
+        }
         if (hide && !hookupPadHidden) {
             hookupPadHidden = true
             lastPadType = -1
