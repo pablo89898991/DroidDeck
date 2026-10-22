@@ -278,7 +278,7 @@ object HookupBridge {
                 file.delete()
                 Os.symlink(target, file.path)
             }
-            File(devices, usb.removePrefix("/sys/devices/droiddeck/")).deleteRecursively()
+            deleteTree(File(devices, usb.removePrefix("/sys/devices/droiddeck/")))   // the previous description
             val vid = id.getInt("vid")
             val pid = id.getInt("pid")
             val ver = id.getInt("version")
@@ -324,6 +324,17 @@ object HookupBridge {
         } catch (e: Exception) {
             note("hookup: could not describe /dev/hidraw${MINOR_BASE + slot}: $e")
         }
+    }
+
+    /**
+     * Deletes a folder without following symbolic links. (File.deleteRecursively() follows them: the description
+     * links "subsystem" to the phone's real /sys/bus/..., and walking into the real /sys -- full of links back into
+     * itself -- never ends, which froze DroidDeck's bridge thread on the second hand-over of a controller.)
+     */
+    private fun deleteTree(f: File) {
+        val st = try { Os.lstat(f.path) } catch (_: Exception) { return }   // gone already
+        if (android.system.OsConstants.S_ISDIR(st.st_mode)) f.list()?.forEach { deleteTree(File(f, it)) }
+        f.delete()
     }
 
     private fun unlinkClass(slot: Int) {
