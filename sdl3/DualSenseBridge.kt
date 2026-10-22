@@ -37,6 +37,16 @@ object DualSenseBridge {
     private const val MSG_FRAME = 10
     private const val MSG_STATUS = 11
     private const val MSG_PAD_GONE = 12
+    // Steam Controller (2026) raw passthrough over USB (cable or wireless puck), see the bridge's triton.h
+    private const val MSG_TRITON_OUTPUT = 4
+    private const val MSG_TRITON_GET = 5
+    private const val MSG_TRITON_RUMBLE = 6
+    private const val MSG_TRITON_STATE = 13
+    private const val MSG_TRITON_CONN = 14
+    private const val MSG_TRITON_FEATURE = 15
+    private const val TRITON_SLOT = 0            // the ring slot DroidDeck's Steam Controller node reads
+    private const val TRITON_STATE_BYTES = 45
+    private const val TRITON_POLL_MS = 2L
     private const val SLOTS = 4
 
     // ---- Tunables (verify on device) ----
@@ -109,12 +119,21 @@ object DualSenseBridge {
     private val lastSepPressure = ShortArray(2)
 
     private val worker = android.os.HandlerThread("ds-bridge", android.os.Process.THREAD_PRIORITY_DISPLAY).apply { start() }
+    private val workerHandler = Handler(worker.looper)
     private val inbox = Messenger(object : Handler(worker.looper) {
         override fun handleMessage(m: Message) {
             when (m.what) {
                 MSG_FRAME -> onFrame(m.data)
                 MSG_STATUS -> if (m.data.getString("text")?.startsWith("Connected") != true) release()
                 MSG_PAD_GONE -> padGone(m.data.getInt("slot"))
+                MSG_TRITON_STATE -> m.data.getByteArray("data")?.let {
+                    if (tritonOn) FakeInputWriter.writeTritonState(TRITON_SLOT, m.data.getInt("id"), it)
+                }
+                MSG_TRITON_CONN -> setTriton(m.data.getBoolean("on"), m.data.getString("what") ?: "")
+                MSG_TRITON_FEATURE -> {
+                    val request = m.data.getLong("request")
+                    if (request == tritonFeatureAsked) FakeInputWriter.writeTritonFeatureReply(TRITON_SLOT, request, m.data.getByteArray("data"))
+                }
             }
         }
     })
@@ -124,7 +143,7 @@ object DualSenseBridge {
             server = Messenger(b)
             send(Message.obtain(null, MSG_REGISTER).apply { replyTo = inbox })
         }
-        override fun onServiceDisconnected(n: ComponentName) { server = null; release() }
+        override fun onServiceDisconnected(n: ComponentName) { server = null; release(); workerHandler.post { setTriton(false, "bridge stopped") } }
     }
 
     /** @return false if the bridge app is not installed / not bindable. */
@@ -150,8 +169,92 @@ object DualSenseBridge {
             bound = false
         }
         release()
+        workerHandler.post { setTriton(false, "session ended") }
         pad = null
         server = null
+    }
+
+    // ---------------- Steam Controller (2026) raw passthrough ----------------
+    // The bridge streams the controller's own HID reports; they go into the same shared block DroidDeck's
+    // Bluetooth LE Steam Controller support uses, so Steam sees DroidDeck's Steam Controller node and drives
+    // it natively (capacitive stick touch, grip sense, trackpad pressure, IMU, haptics, settings). Steam's
+    // output reports and feature reads/writes travel back to the controller the same way.
+    @Volatile private var tritonOn = false
+    private var tritonOutputSeq = 0L
+    private var tritonFeatureAsked = 0L
+    private val tritonPoll = object : Runnable {
+        override fun run() {
+            if (!tritonOn) return
+            while (true) {
+                val out = FakeInputWriter.readTritonOutput(TRITON_SLOT, tritonOutputSeq) ?: break
+                tritonOutputSeq = java.nio.ByteBuffer.wrap(out, 0, 8).order(java.nio.ByteOrder.LITTLE_ENDIAN).long
+                send(Message.obtain(null, MSG_TRITON_OUTPUT).apply {
+                    data = Bundle().apply {
+                        putByteArray("data", out.copyOfRange(9, out.size))
+                        putBoolean("feature", out[8] != 0.toByte())
+                    }
+                })
+            }
+            val request = FakeInputWriter.readTritonFeatureRequest(TRITON_SLOT)
+            if (request != 0L && request != tritonFeatureAsked) {
+                tritonFeatureAsked = request
+                send(Message.obtain(null, MSG_TRITON_GET).apply {
+                    data = Bundle().apply { putLong("request", request); putInt("id", 1) }
+                })
+            }
+            workerHandler.postDelayed(this, TRITON_POLL_MS)
+        }
+    }
+
+    /** Runs on the worker thread. */
+    private fun setTriton(on: Boolean, what: String) {
+        if (on == tritonOn) return
+        tritonOn = on
+        workerHandler.removeCallbacks(tritonPoll)
+        if (on) {
+            tritonFeatureAsked = 0L
+            FakeInputWriter.setTritonConnected(TRITON_SLOT, true)
+            workerHandler.post(tritonPoll)
+        } else {
+            tritonRumbleStop?.let { rumbleTimer.removeCallbacks(it) }
+            tritonRumbleStop = null
+            FakeInputWriter.setTritonConnected(TRITON_SLOT, false)
+            FakeInputWriter.writeTritonState(TRITON_SLOT, 0x45, ByteArray(TRITON_STATE_BYTES))
+        }
+        android.util.Log.i("SessionService", "steam controller: SDL3 bridge passthrough ${if (on) "on ($what)" else "off ($what)"}")
+    }
+
+    /** True while a Steam Controller (2026) is passed through by the bridge (cable or puck). */
+    @JvmStatic fun isTritonPassthrough(): Boolean = tritonOn
+
+    /**
+     * True when the SDL3 bridge app is installed. DroidDeck then prepares its Steam Controller node at session
+     * start even without a Bluetooth-paired one, so a cable/puck controller can appear at any time (hot-plug).
+     */
+    @JvmStatic
+    fun isBridgeInstalled(context: Context): Boolean = try {
+        context.packageManager.getPackageInfo(BRIDGE_PKG, 0); true
+    } catch (_: Exception) { false }
+
+    private var tritonRumbleStop: Runnable? = null
+
+    private fun tritonRumble(strong: Int, weak: Int, ms: Int) {
+        rumbleTimer.post {
+            tritonRumbleStop?.let { rumbleTimer.removeCallbacks(it) }
+            tritonRumbleStop = null
+            sendTritonRumble(strong, weak)
+            if (strong == 0 && weak == 0) return@post
+            val hold = if (ms == RUMBLE_HOLD_MS || ms <= 0) HOLD_SAFETY_MS else ms.toLong().coerceIn(1L, 5000L)
+            val stop = Runnable { sendTritonRumble(0, 0); tritonRumbleStop = null }
+            tritonRumbleStop = stop
+            rumbleTimer.postDelayed(stop, hold)
+        }
+    }
+
+    private fun sendTritonRumble(strong: Int, weak: Int) {
+        send(Message.obtain(null, MSG_TRITON_RUMBLE).apply {
+            data = Bundle().apply { putInt("l", strong.coerceIn(0, 65535)); putInt("r", weak.coerceIn(0, 65535)) }
+        })
     }
 
     /** Forward game rumble (0..255 each) to the physical controller of player 1. */
@@ -252,17 +355,19 @@ object DualSenseBridge {
      */
     @JvmStatic
     fun routeRumble(slot: Int, strong: Int, weak: Int, ms: Int): Boolean {
+        // Only a passed-through Steam Controller (2026), no bridged gamepad: player 1 / virtual-pad rumble -> it.
+        if (tritonOn && !isBridgedSlot(0) && (slot == 0 || slot >= PadBridge.SLOTS) && JoyCon.vrRumbleDevice(slot) == null &&
+            (slot == 0 || !realAndroidPadActive())) {
+            val on = (strong != 0 || weak != 0) && ms != 0
+            if (on) tritonRumble(strong, weak, ms) else tritonRumble(0, 0, 0)
+            return true
+        }
         val deckSlot = when {
             slot in 0 until PadBridge.SLOTS -> if (isBridgedSlot(slot)) slot else return false
             JoyCon.vrRumbleDevice(slot) != null -> return false
             !isBridgedSlot(0) -> return false
             else -> {
-                val id = PadBridge.activeControllerId()
-                if (id != PadBridge.NO_CONTROLLER) {
-                    val dev = InputDevice.getDevice(id)
-                    // a real Android pad with motors is in use: leave it to upstream
-                    if (dev != null && !isBridged(dev) && hasMotors(dev)) return false
-                }
+                if (realAndroidPadActive()) return false   // a real Android pad with motors is in use: leave it to upstream
                 0
             }
         }
@@ -275,6 +380,13 @@ object DualSenseBridge {
         return true
     }
     @Volatile private var rumbleLogged = false
+
+    private fun realAndroidPadActive(): Boolean {
+        val id = PadBridge.activeControllerId()
+        if (id == PadBridge.NO_CONTROLLER) return false
+        val dev = InputDevice.getDevice(id) ?: return false
+        return !isBridged(dev) && hasMotors(dev)
+    }
 
     private fun hasMotors(dev: InputDevice): Boolean = try {
         if (android.os.Build.VERSION.SDK_INT >= 31) dev.vibratorManager.vibratorIds.isNotEmpty()

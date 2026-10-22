@@ -867,5 +867,24 @@ else
   warn "fakeinput_steam.cpp / SteamDeckPad.kt / FakeInputWriter.java not found (skipping Steam Controller 2015)"
 fi
 
+# ---------- 14. Steam Controller (2026) over USB cable / wireless puck via the SDL3 bridge ----------
+# DroidDeck only prepares its Steam Controller node (/dev/hidraw18) when a Bluetooth one is paired. The
+# SDL3 bridge can now pass a cable or puck Steam Controller through raw (DualSenseBridge.kt), so prepare the
+# node whenever the bridge app is installed too. It stays invisible to Steam until a controller is actually
+# streaming (connected flag in the shared block), and appears/disappears with hot-plug udev events.
+SVC="$PKG/session/SessionService.kt"
+if [ -f "$SVC" ]; then
+  if grep -q "DualSenseBridge.isBridgeInstalled" "$SVC"; then
+    skip "Steam Controller node for the bridge's cable/puck passthrough"
+  elif grep -q "val wantsTriton = wantsDeck && SteamControllerBle.hasPairedController(this)" "$SVC"; then
+    sed -i 's/val wantsTriton = wantsDeck \&\& SteamControllerBle.hasPairedController(this)/val wantsTriton = wantsDeck \&\& (SteamControllerBle.hasPairedController(this) || com.droiddeck.launcher.input.DualSenseBridge.isBridgeInstalled(this))/' "$SVC"
+    grep -q "DualSenseBridge.isBridgeInstalled" "$SVC" && ok "Steam Controller node for the bridge's cable/puck passthrough" || die "SessionService wantsTriton patch failed"
+  else
+    die "SessionService: wantsTriton anchor moved (re-anchor step 14)"
+  fi
+else
+  warn "SessionService.kt not found (skipping Steam Controller passthrough node)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
