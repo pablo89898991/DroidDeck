@@ -255,6 +255,8 @@ class DrawerActions(
     val lowLatencyTouch: Boolean = false,
     val onLowLatencyController: (Boolean) -> Unit = {},
     val onLowLatencyTouch: (Boolean) -> Unit = {},
+    val gameThreadHints: Boolean = true,
+    val onGameThreadHints: (Boolean) -> Unit = {},
     val onTouch: (String) -> Unit,
     val onGestureSettings: () -> Unit = {},
     val onFexPreset: (String) -> Unit,
@@ -577,6 +579,9 @@ internal fun SessionDrawer(open: Boolean, requestedPage: SessionDrawerPage, cont
                                 ToggleRow(host, "low-latency-touch", stringResource(R.string.drawer_low_latency_touch),
                                     stringResource(R.string.drawer_low_latency_touch_hint), a.lowLatencyTouch,
                                     chipModifier = focus.track(page, "low-latency-touch"), onChange = a.onLowLatencyTouch)
+                                ToggleRow(host, "game-thread-hints", stringResource(R.string.drawer_game_thread_hints),
+                                    stringResource(R.string.drawer_game_thread_hints_hint), a.gameThreadHints,
+                                    chipModifier = focus.track(page, "game-thread-hints"), onChange = a.onGameThreadHints)
                             }
                             SettingsGroup(stringResource(R.string.drawer_keyboard)) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(8.dp)) {

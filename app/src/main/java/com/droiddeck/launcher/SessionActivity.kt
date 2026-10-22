@@ -302,6 +302,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var backActionsInverted by mutableStateOf(false)
     private var lowLatencyController by mutableStateOf(false)
     private var lowLatencyTouch by mutableStateOf(false)
+    private var gameThreadHints by mutableStateOf(true)
     private var padType by mutableStateOf(SessionPrefs.CONTROLLER_DECK)
     private var pcKeyboardOpen by mutableStateOf(false)
     private var achievementsInFront by mutableStateOf<AchievementsInFront?>(null)
@@ -864,6 +865,13 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                     },
                     lowLatencyController = lowLatencyController,
                     lowLatencyTouch = lowLatencyTouch,
+                    gameThreadHints = gameThreadHints,
+                    onGameThreadHints = { on ->
+                        SessionPrefs.setGameThreadHints(this@SessionActivity, on)
+                        gameThreadHints = on
+                        if (on) android.util.Log.i("GameThreadHints", com.droiddeck.launcher.session.GameThreadHints.start(this@SessionActivity))
+                        else com.droiddeck.launcher.session.GameThreadHints.stop()
+                    },
                     onLowLatencyController = { on ->
                         SessionPrefs.setLowLatencyController(this@SessionActivity, on)
                         lowLatencyController = on
@@ -1448,6 +1456,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         backActionsInverted = SessionPrefs.backActionsInverted(this)
         lowLatencyController = SessionPrefs.lowLatencyController(this)
         lowLatencyTouch = SessionPrefs.lowLatencyTouch(this)
+        gameThreadHints = SessionPrefs.gameThreadHints(this)
         padType = SessionPrefs.steamController(this)
     }
 

@@ -433,6 +433,10 @@ object SessionPrefs {
     /** Whether the game's busiest threads are named to the power HAL for a boost (GameThreadHints). */
     fun gameThreadHints(context: Context): Boolean = prefs(context).getBoolean("gameThreadHints", true)
 
+    fun setGameThreadHints(context: Context, on: Boolean) {
+        prefs(context).edit().putBoolean("gameThreadHints", on).apply()
+    }
+
     fun prootNoSeccomp(context: Context): Boolean = prefs(context).getBoolean("prootNoSeccomp", false)
 
     fun setProotNoSeccomp(context: Context, on: Boolean) {
