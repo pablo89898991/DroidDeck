@@ -152,6 +152,7 @@ class MainActivity : ComponentActivity() {
     private var fsyncFirst by mutableStateOf(false)
     private var gamescopeRealtime by mutableStateOf(false)
     private var gpuClockPin by mutableStateOf(false)
+    private var gameThreadHints by mutableStateOf(true)
     private var prootNoSeccomp by mutableStateOf(false)
     private var prootFastPath by mutableStateOf(true)
     private var guestHostname by mutableStateOf(SessionPrefs.DEFAULT_GUEST_HOSTNAME)
@@ -1763,6 +1764,7 @@ class MainActivity : ComponentActivity() {
             fsyncFirst = fsyncFirst,
             gamescopeRealtime = gamescopeRealtime,
             gpuClockPin = gpuClockPin,
+            gameThreadHints = gameThreadHints,
             prootNoSeccomp = prootNoSeccomp, prootFastPath = prootFastPath, guestHostname = guestHostname, phantomWarning = phantomWarning,
             onClientOverride = { on -> SessionPrefs.setClientCpusOverride(this, on); clientOverride = on },
             onTuSysmem = { on -> SessionPrefs.setTuSysmem(this, on); tuSysmem = on },
@@ -1775,6 +1777,7 @@ class MainActivity : ComponentActivity() {
             onFsyncFirst = { on -> SessionPrefs.setFsyncFirst(this, on); fsyncFirst = on },
             onGamescopeRealtime = { on -> SessionPrefs.setGamescopeRealtime(this, on); gamescopeRealtime = on },
             onGpuClockPin = { on -> SessionPrefs.setGpuClockPin(this, on); gpuClockPin = on },
+            onGameThreadHints = { on -> SessionPrefs.setGameThreadHints(this, on); gameThreadHints = on },
             onProotNoSeccomp = { on -> SessionPrefs.setProotNoSeccomp(this, on); prootNoSeccomp = on },
             onProotFastPath = { on -> SessionPrefs.setProotFastPath(this, on); prootFastPath = on },
             onGuestHostname = { name -> SessionPrefs.setGuestHostname(this, name) },
@@ -1957,6 +1960,7 @@ class MainActivity : ComponentActivity() {
         fsyncFirst = SessionPrefs.fsyncFirst(this)
         gamescopeRealtime = SessionPrefs.gamescopeRealtime(this)
         gpuClockPin = SessionPrefs.gpuClockPin(this)
+        gameThreadHints = SessionPrefs.gameThreadHints(this)
         prootNoSeccomp = SessionPrefs.prootNoSeccomp(this)
         prootFastPath = SessionPrefs.prootFastPath(this)
         guestHostname = SessionPrefs.guestHostname(this)

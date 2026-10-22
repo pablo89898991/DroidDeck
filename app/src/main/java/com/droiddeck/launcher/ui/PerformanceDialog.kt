@@ -44,6 +44,7 @@ fun PerformancePage(
     fsyncFirst: Boolean,
     gamescopeRealtime: Boolean,
     gpuClockPin: Boolean,
+    gameThreadHints: Boolean = true,
     prootNoSeccomp: Boolean,
     prootFastPath: Boolean,
     guestHostname: String,
@@ -59,6 +60,7 @@ fun PerformancePage(
     onFsyncFirst: (Boolean) -> Unit,
     onGamescopeRealtime: (Boolean) -> Unit,
     onGpuClockPin: (Boolean) -> Unit,
+    onGameThreadHints: (Boolean) -> Unit = {},
     onProotNoSeccomp: (Boolean) -> Unit,
     onProotFastPath: (Boolean) -> Unit,
     onGuestHostname: (String) -> Unit,
@@ -112,6 +114,11 @@ fun PerformancePage(
                 host, "gsrealtime", stringResource(R.string.perf_gsrealtime),
                 stringResource(R.string.perf_gsrealtime_hint),
                 gamescopeRealtime, onChange = onGamescopeRealtime,
+            )
+            ToggleRow(
+                host, "gamethreadhints", stringResource(R.string.drawer_game_thread_hints),
+                stringResource(R.string.drawer_game_thread_hints_hint),
+                gameThreadHints, onChange = onGameThreadHints,
             )
         }
         SettingsGroup(stringResource(R.string.perf_gpu)) {

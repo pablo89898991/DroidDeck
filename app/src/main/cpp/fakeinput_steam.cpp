@@ -3423,7 +3423,14 @@ __attribute__((visibility("hidden"))) static void *hookup_watch_thread(void *) {
 
 __attribute__((constructor)) static void start_hookup_watch() {
   config();
-  if (!process_is_steam_client() || !fake_deck_enabled() || !hookup_shm()) return;
+  if (!process_is_steam_client() || !fake_deck_enabled()) return;
+  const char *path = getenv("FAKE_HOOKUP_SHM");
+  if (!path || !*path) {
+    Logger::log("hookup: off (no FAKE_HOOKUP_SHM: the SDL3 bridge app is not installed, or an older DroidDeck build)\n");
+    return;
+  }
+  if (!hookup_shm()) return;
+  Logger::log("hookup: watching %s for controllers handed over by the SDL3 bridge\n", path);
   pthread_t thread;
   if (pthread_create(&thread, nullptr, hookup_watch_thread, nullptr) == 0) pthread_detach(thread);
 }

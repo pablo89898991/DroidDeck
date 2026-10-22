@@ -714,7 +714,9 @@ class SessionService : Service() {
     private fun addControllerEnvironment(guest: MutableList<String>, fakeInputDir: File, sessionDir: File) {
         FakeInputWriter.prepareRingSlots(fakeInputDir, 4)
         val builtinPad = SessionPrefs.builtinPad(this)
-        val hiddenPad = SessionState.mode == MODE_STEAM && !builtinPad
+        val hiddenPad = SessionState.mode == MODE_STEAM && !builtinPad &&
+            !com.droiddeck.launcher.input.PadBridge.anyControllerConnected()
+        com.droiddeck.launcher.input.PadBridge.setFirstSlot(if (hiddenPad) 1 else 0)
         fakeInputDir.listFiles()?.forEach { file ->
             val node = Regex("event(\\d+)").matchEntire(file.name)?.groupValues?.get(1)?.toIntOrNull()
             if (file.name.startsWith(".uinput-") || (node != null && node >= FIRST_VIRTUAL_PAD) ||
@@ -751,7 +753,7 @@ class SessionService : Service() {
                     guest.add("FAKE_TOUCHCTL_RING=" + it.path)
                 }
                 if (com.droiddeck.launcher.input.HookupBridge.wanted(this))
-                    com.droiddeck.launcher.input.HookupBridge.prepare(fakeInputDir)?.let { guest.add("FAKE_HOOKUP_SHM=" + it.path) }
+                    com.droiddeck.launcher.input.HookupBridge.prepare(fakeInputDir, File(sessionDir, "pad.log"))?.let { guest.add("FAKE_HOOKUP_SHM=" + it.path) }
                 guest.add("FAKE_DECK_SYSFS_LISTING=" + SteamDeckPad.listingDir(fakeInputDir.parentFile!!.parentFile!!).path)
             }
         } else if (SessionState.mode == MODE_STEAM) {
