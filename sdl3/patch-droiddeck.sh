@@ -1320,5 +1320,32 @@ PY
   fi
 fi
 
+# ---------- 20. CI downloads retry instead of hanging ----------
+# The APK build downloads gamescope, mangoapp, PipeWire and msitools packages with curl, which has no time
+# limit: one stalled connection (Valve's package servers do that now and then) hangs the build until GitHub
+# kills it after 45 minutes. A ~/.curlrc written first makes a stalled download time out (no connection in 30 s,
+# or under 2 KB/s for a minute), and the build's own --retry 3 then tries again.
+if [ -f "$WF/build.yml" ]; then
+  if python3 - "$WF/build.yml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+MARK = "SDL3Deck: downloads retry instead of hanging"
+if MARK in s:
+    print("already"); sys.exit(0)
+anchor = "      - name: Build libfakeinput.so and libblsession.so"
+if s.count(anchor) != 1:
+    sys.stderr.write("ANCHOR-MISS curlrc :: %r (found %d)\n" % (anchor, s.count(anchor))); sys.exit(3)
+step = ("      - name: \"" + MARK + "\"\n"
+        "        run: printf 'connect-timeout = 30\\nspeed-limit = 2048\\nspeed-time = 60\\n' > \"$HOME/.curlrc\"\n\n")
+s = s.replace(anchor, step + anchor, 1)
+open(p, "w", encoding="utf-8").write(s)
+print("OK")
+PY
+  then ok "CI downloads time out and retry instead of hanging the build"
+  else warn "could not add the CI download timeouts (upstream build.yml changed)"
+  fi
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
