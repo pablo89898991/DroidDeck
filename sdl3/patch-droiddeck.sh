@@ -1257,32 +1257,66 @@ PY
   fi
 fi
 
-# ---------- 19. Upstream's "human authorship" gate only on the upstream repository ----------
-# Upstream DroidDeck checks that commits to ITS repository are written by people. In this fork every
-# build starts from an automatic sync commit (sdl3-sync[bot]), which that gate rejects, so the build
-# stopped before compiling. Keep the check exactly as is for Droid-Deck/droiddeck and skip it here.
-# (If you ever send changes upstream, their policy applies: those must be your own commits.)
-AUTHYML="$DD/.github/workflows/authorship.yml"
-if [ -f "$BUILDYML" ] || [ -f "$AUTHYML" ]; then
-  if python3 - "$BUILDYML" "$AUTHYML" <<'PY'
-import sys, os
-build, auth = sys.argv[1], sys.argv[2]
+# ---------- 19. Upstream-only workflows stay upstream ----------
+# Upstream DroidDeck's other workflows -- its "human authorship" gate, and the builders for KWin / the KDE
+# desktop, FEX, gamescope and the AAudio sink -- start on pushes that touch their folders. In this fork every
+# sync pushes upstream's latest tree, so they ran here too: the authorship gate failed on the sync bot's
+# commits, and e.g. a KWin update made GitHub compile all of KWin. None of that is needed for the APK (it
+# downloads those components from upstream's releases). Each of their jobs now runs only on
+# Droid-Deck/droiddeck; upstream itself is unchanged. (Changes you ever send upstream must be your own commits.)
+WF="$DD/.github/workflows"
+if [ -d "$WF" ]; then
+  if python3 - "$WF" <<'PY'
+import os, re, sys
+wf = sys.argv[1]
 COND = "github.repository == 'Droid-Deck/droiddeck'"
-def patch(path, old, new):
+changed = []
+def gate_jobs(text):
+    lines = text.split("\n")
+    out, in_jobs, i = [], False, 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        if re.match(r"^jobs:\s*$", line):
+            in_jobs = True
+        elif in_jobs and re.match(r"^\S", line):
+            in_jobs = False
+        elif in_jobs and re.match(r"^  [A-Za-z0-9_-]+:\s*$", line):
+            # this job's own keys: lines indented exactly 4 spaces until the next job
+            j, has_if = i + 1, False
+            while j < len(lines) and not re.match(r"^  \S", lines[j]) and not re.match(r"^\S", lines[j]):
+                if re.match(r"^    if:", lines[j]):
+                    has_if = True
+                j += 1
+            if not has_if:
+                out.append("    if: " + COND)
+        i += 1
+    return "\n".join(out)
+# build.yml (the APK) keeps its jobs; only its authorship step is gated. Reusable workflows it calls
+# (sign/publish-packs/update-catalog) and PR/release flows are left alone.
+for name in ("authorship.yml", "build-aaudio-sink.yml", "build-desktop-kde.yml", "build-fex.yml", "build-gamescope.yml"):
+    path = os.path.join(wf, name)
     if not os.path.exists(path):
-        return
-    s = open(path, encoding='utf-8').read()
-    if COND in s or old not in s:
-        return
-    open(path, 'w', encoding='utf-8').write(s.replace(old, new, 1))
-patch(build, "      - name: Check human authorship\n",
-      "      - name: Check human authorship\n        if: " + COND + "\n")
-patch(auth, "  authorship:\n    name: Validate human authorship\n",
-      "  authorship:\n    if: " + COND + "\n    name: Validate human authorship\n")
-print("OK")
+        continue
+    s = open(path, encoding="utf-8").read()
+    if COND in s:
+        continue
+    new = gate_jobs(s)
+    if new != s:
+        open(path, "w", encoding="utf-8").write(new)
+        changed.append(name)
+build = os.path.join(wf, "build.yml")
+if os.path.exists(build):
+    s = open(build, encoding="utf-8").read()
+    old = "      - name: Check human authorship\n"
+    if COND not in s and old in s:
+        s = s.replace(old, old + "        if: " + COND + "\n", 1)
+        open(build, "w", encoding="utf-8").write(s)
+        changed.append("build.yml (authorship step)")
+print("gated: " + (", ".join(changed) if changed else "nothing new"))
 PY
-  then ok "upstream authorship check limited to the upstream repo"
-  else warn "could not adjust the authorship check"
+  then ok "upstream-only workflows (authorship, KWin/KDE, FEX, gamescope, AAudio) skipped in this fork"
+  else warn "could not gate the upstream-only workflows"
   fi
 fi
 
