@@ -257,7 +257,8 @@ cpp, sdp, fiw = sys.argv[1], sys.argv[2], sys.argv[3]
 def patch(path, edits):
     s = open(path, encoding='utf-8').read()
     for old, new, marker in edits:
-        if marker in s:
+        markers = marker if isinstance(marker, tuple) else (marker,)
+        if any(m in s for m in markers):
             continue  # already applied (idempotent)
         n = s.count(old)
         if n != 1:
@@ -386,10 +387,10 @@ patch(cpp, [
      'type == PAD_TYPE_DUALSENSE_EDGE ? DUALSENSE_EDGE_HIDRAW_MINOR'),
     ('                                 "DualShock 4", "DualSense"};',
      '                                 "DualShock 4", "DualSense", "DualSense Edge"};',
-     '"DualSense", "DualSense Edge"}'),
+     ('"DualSense", "DualSense Edge"}', '"Steam Controller (2015)"}')),
     ('kNames[was % 5]',
      'kNames[was % 6]',
-     'kNames[was % 6]'),
+     ('kNames[was % 6]', 'kNames[was % 7]')),
     # Sony touchpad (DualShock 4, DualSense, DualSense Edge): one full-width multitouch surface, never
     # the Deck's two halves. A real Sony pad is a single surface where finger 0 is the primary touch,
     # so confining finger 1 to the right half loses any touch that lands on it alone. put_sony_touch is
@@ -527,6 +528,343 @@ PY
   fi
 else
   warn "fakeinput_steam.cpp not found (skipping Sony rumble decode)"
+fi
+
+# ---------- 13. Add the ORIGINAL Steam Controller (2015, 28de:1102 wired) as its own pad type ----------
+# DroidDeck's "Steam Controller" pad type is the 2026 Steam Controller (codename Triton, 28de:1302). This
+# adds the 2015 model as pad type 6 on a new node (/dev/hidraw23). It speaks the same Valve HID protocol
+# as the Deck pad (features 0x81/0x83/0x87/0x8f/0xae...), so it reuses the Deck's open/feature/ioctl path
+# with its own identity, and sends the 2015 state packet (ValveInReport type 1):
+#   no right stick (the DualSense right stick is unused, like the real controller); left stick and left
+#   trackpad share one axis pair (interleaved, like the real firmware); D-pad = left trackpad edge clicks;
+#   L4/L5 -> left grip, R4/R5 -> right grip. Longer trackpad haptic pulses (Steam's rumble/identify on this
+#   controller) are forwarded as rumble; short tick pulses are ignored.
+CPP="$DD/app/src/main/cpp/fakeinput_steam.cpp"
+SDP="$PKG/session/SteamDeckPad.kt"
+FIW="$IN/FakeInputWriter.java"
+if [ -f "$CPP" ] && [ -f "$SDP" ] && [ -f "$FIW" ]; then
+  if python3 - "$CPP" "$SDP" "$FIW" <<'PY'
+import sys
+cpp, sdp, fiw = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def patch(path, edits):
+    s = open(path, encoding='utf-8').read()
+    for edit in edits:
+        old, new, marker = edit[0], edit[1], edit[2]
+        want = edit[3] if len(edit) > 3 else 1
+        if marker in s:
+            continue  # already applied (idempotent)
+        n = s.count(old)
+        if n != want:
+            sys.stderr.write("ANCHOR-MISS %s :: %r (found %d, expected %d)\n" % (path, old[:70], n, want))
+            sys.exit(3)
+        s = s.replace(old, new)
+    open(path, 'w', encoding='utf-8').write(s)
+
+# ---- FakeInputWriter.java ----
+patch(fiw, [
+    ('    public static final int PAD_TYPE_DUALSENSE_EDGE = 5;',
+     '    public static final int PAD_TYPE_DUALSENSE_EDGE = 5;\n'
+     '    public static final int PAD_TYPE_STEAM_2015 = 6;',
+     'PAD_TYPE_STEAM_2015 = 6'),
+])
+
+# ---- SteamDeckPad.kt: /dev/hidraw23 described as 28de:1102 interface 2 ----
+patch(sdp, [
+    ('    private const val SONY_DUALSENSE_EDGE_MINOR = 22',
+     '    private const val SONY_DUALSENSE_EDGE_MINOR = 22\n'
+     '    private const val SC2015_MINOR = 23',
+     'SC2015_MINOR = 23'),
+    ('            com.droiddeck.launcher.input.FakeInputWriter.PAD_TYPE_DUALSENSE_EDGE -> SONY_DUALSENSE_EDGE_MINOR',
+     '            com.droiddeck.launcher.input.FakeInputWriter.PAD_TYPE_DUALSENSE_EDGE -> SONY_DUALSENSE_EDGE_MINOR\n'
+     '            com.droiddeck.launcher.input.FakeInputWriter.PAD_TYPE_STEAM_2015 -> SC2015_MINOR',
+     'PAD_TYPE_STEAM_2015 -> SC2015_MINOR'),
+    ('            describeTriton(wired = true)\n',
+     '            fun describeSteamController2015() {\n'
+     '                val usb = "$GUEST_DEVICES/usb7"\n'
+     '                val iface = "$usb/7-1:1.2"\n'
+     '                val hid = "$iface/0003:28DE:1102.0008"\n'
+     '                val node = "hidraw$SC2015_MINOR"\n'
+     '                write(usb, "uevent", "DEVTYPE=usb_device\\nPRODUCT=28de/1102/100\\nTYPE=0/0/0\\nBUSNUM=007\\nDEVNUM=002\\n")\n'
+     '                write(usb, "idVendor", "28de\\n")\n'
+     '                write(usb, "idProduct", "1102\\n")\n'
+     '                write(usb, "bcdDevice", "0100\\n")\n'
+     '                write(usb, "manufacturer", "Valve Software\\n")\n'
+     '                write(usb, "product", "Steam Controller\\n")\n'
+     '                write(usb, "serial", "DROIDDECKSC15\\n")\n'
+     '                link(File(dir(usb), "subsystem"), "/sys/bus/usb")\n'
+     '                write(iface, "uevent", "DEVTYPE=usb_interface\\nPRODUCT=28de/1102/100\\nINTERFACE=3/0/0\\n")\n'
+     '                write(iface, "bInterfaceNumber", "02\\n")\n'
+     '                write(iface, "bInterfaceClass", "03\\n")\n'
+     '                link(File(dir(iface), "subsystem"), "/sys/bus/usb")\n'
+     '                write(hid, "uevent", "DRIVER=hid-steam\\nHID_ID=0003:000028DE:00001102\\n" +\n'
+     '                    "HID_NAME=Valve Software Steam Controller\\nHID_PHYS=usb-droiddeck-7/input2\\n" +\n'
+     '                    "HID_UNIQ=DROIDDECKSC15\\nMODALIAS=hid:b0003g0001v000028DEp00001102\\n")\n'
+     '                File(dir(hid), "report_descriptor").writeBytes(REPORT_DESCRIPTOR)\n'
+     '                link(File(dir(hid), "subsystem"), "/sys/bus/hid")\n'
+     '                val hidraw = "$hid/hidraw/$node"\n'
+     '                write(hidraw, "uevent", "MAJOR=$MAJOR\\nMINOR=$SC2015_MINOR\\nDEVNAME=$node\\n")\n'
+     '                write(hidraw, "dev", "$MAJOR:$SC2015_MINOR\\n")\n'
+     '                link(File(dir(hidraw), "subsystem"), "/sys/class/hidraw")\n'
+     '                link(File(dir(hidraw), "device"), hid)\n'
+     '                padNodes[SC2015_MINOR] = hidraw\n'
+     '                link(File(LinuxRuntime.liveDir(context), "drm/sys/$MAJOR:$SC2015_MINOR"), hidraw)\n'
+     '                File(udevData, "c$MAJOR:$SC2015_MINOR").writeText("I:1\\nE:ID_INPUT=1\\nE:ID_INPUT_JOYSTICK=1\\n")\n'
+     '                Log.i(TAG, "steam controller: /dev/$node described as the 2015 Steam Controller (28de:1102)")\n'
+     '            }\n'
+     '            describeSteamController2015()\n'
+     '            describeTriton(wired = true)\n',
+     'describeSteamController2015()'),
+])
+
+# ---- fakeinput_steam.cpp ----
+SC1_CODE = r'''// sdl3bridge: Steam Controller (2015) state packet -- ValveInReport_t type 1 (ID_CONTROLLER_STATE),
+// laid out as SDL's ValveControllerStatePacket_t: buttons in bytes 8..10, analog triggers in bytes 11/12,
+// left axes 16/18 (stick OR left pad, see SC1_FINGER_LEFT), right pad 20/22, triggers 24/26, accel 28..,
+// gyro 34.., orientation quaternion 40...
+static constexpr uint32_t SC1_RT = 0x000001, SC1_LT = 0x000002, SC1_RB = 0x000004, SC1_LB = 0x000008,
+                          SC1_Y = 0x000010, SC1_B = 0x000020, SC1_X = 0x000040, SC1_A = 0x000080,
+                          SC1_UP = 0x000100, SC1_RIGHT = 0x000200, SC1_LEFT = 0x000400, SC1_DOWN = 0x000800,
+                          SC1_BACK = 0x001000, SC1_STEAM = 0x002000, SC1_START = 0x004000,
+                          SC1_LGRIP = 0x008000, SC1_RGRIP = 0x010000, SC1_LPAD_CLICK = 0x020000,
+                          SC1_RPAD_CLICK = 0x040000, SC1_FINGER_LEFT = 0x080000, SC1_FINGER_RIGHT = 0x100000,
+                          SC1_STICK_CLICK = 0x400000, SC1_PAD_AND_STICK = 0x800000;
+static constexpr int32_t SC1_STICK_ACTIVE = 2000;
+static constexpr int16_t SC1_DPAD_EDGE = 24000;
+
+__attribute__((visibility("hidden"))) static void
+build_sc1_report(uint8_t *report, uint32_t packet, uint32_t buttons, const int32_t *axes, const DeckExtras &extras) {
+  memset(report, 0, DECK_REPORT_BYTES);
+  report[0] = 0x01;  // report version 1
+  report[2] = 0x01;  // ID_CONTROLLER_STATE
+  report[3] = 0x3c;
+  put32(report + 4, packet);
+  // Snapshot order: A B X Y L1 R1 View Menu L3 R3 Steam. No right stick on this controller, so no R3.
+  static const uint32_t kButtonBits[11] = {SC1_A,  SC1_B,     SC1_X,          SC1_Y, SC1_LB,   SC1_RB,
+                                           SC1_BACK, SC1_START, SC1_STICK_CLICK, 0,     SC1_STEAM};
+  uint32_t bits = 0;
+  for (int i = 0; i < 11; i++)
+    if (buttons & (1u << i)) bits |= kButtonBits[i];
+  int32_t left_trigger = std::max(0, std::min(255, axes[5])), right_trigger = std::max(0, std::min(255, axes[4]));
+  if (left_trigger >= 250) bits |= SC1_LT;
+  if (right_trigger >= 250) bits |= SC1_RT;
+  uint32_t controls = extras.controls;
+  if (controls & (DECK_EXTRA_L4 | DECK_EXTRA_L5)) bits |= SC1_LGRIP;
+  if (controls & (DECK_EXTRA_R4 | DECK_EXTRA_R5)) bits |= SC1_RGRIP;
+  bool left_pad = controls & DECK_EXTRA_LPAD_TOUCH, right_pad = controls & DECK_EXTRA_RPAD_TOUCH;
+  if (controls & DECK_EXTRA_LPAD_CLICK) bits |= SC1_LPAD_CLICK;
+  if (controls & DECK_EXTRA_RPAD_CLICK) bits |= SC1_RPAD_CLICK;
+  int32_t left_x = extras.pads[0], left_y = extras.pads[1];
+  // The real controller has no D-pad: its D-pad is a click on the left trackpad's edge.
+  int32_t hat_x = axes[6], hat_y = axes[7];
+  if (hat_x || hat_y) {
+    if (hat_y < 0) bits |= SC1_UP;
+    if (hat_y > 0) bits |= SC1_DOWN;
+    if (hat_x < 0) bits |= SC1_LEFT;
+    if (hat_x > 0) bits |= SC1_RIGHT;
+    left_pad = true;
+    left_x = hat_x < 0 ? -SC1_DPAD_EDGE : hat_x > 0 ? SC1_DPAD_EDGE : 0;
+    left_y = hat_y < 0 ? SC1_DPAD_EDGE : hat_y > 0 ? -SC1_DPAD_EDGE : 0;
+    bits |= SC1_LPAD_CLICK;
+  }
+  auto clamp16 = [](int32_t value) { return std::max(-32767, std::min(32767, value)); };
+  int32_t stick_x = clamp16(axes[0]), stick_y = clamp16(-axes[1]);
+  bool stick = abs(stick_x) > SC1_STICK_ACTIVE || abs(stick_y) > SC1_STICK_ACTIVE;
+  // The stick and the left pad share one axis pair; SC1_FINGER_LEFT says which one this packet carries,
+  // and SC1_PAD_AND_STICK says both are in use (the firmware then alternates them packet by packet).
+  int32_t axis_x = stick_x, axis_y = stick_y;
+  if (left_pad && stick) {
+    bits |= SC1_PAD_AND_STICK;
+    if (packet & 1) {
+      bits |= SC1_FINGER_LEFT;
+      axis_x = left_x;
+      axis_y = left_y;
+    }
+  } else if (left_pad) {
+    bits |= SC1_FINGER_LEFT;
+    axis_x = left_x;
+    axis_y = left_y;
+  }
+  if (right_pad) bits |= SC1_FINGER_RIGHT;
+  report[8] = static_cast<uint8_t>(bits);
+  report[9] = static_cast<uint8_t>(bits >> 8);
+  report[10] = static_cast<uint8_t>(bits >> 16);
+  report[11] = static_cast<uint8_t>(left_trigger);
+  report[12] = static_cast<uint8_t>(right_trigger);
+  put16(report + 16, clamp16(axis_x));
+  put16(report + 18, clamp16(axis_y));
+  put16(report + 20, right_pad ? extras.pads[2] : 0);
+  put16(report + 22, right_pad ? extras.pads[3] : 0);
+  put16(report + 24, left_trigger * 32767 / 255);
+  put16(report + 26, right_trigger * 32767 / 255);
+  for (int i = 0; i < 3; i++) {
+    put16(report + 28 + i * 2, extras.accel[i]);
+    put16(report + 34 + i * 2, extras.gyro[i]);
+  }
+  put16(report + 40, 32767);  // orientation quaternion: identity (Steam uses the raw gyro)
+}
+
+__attribute__((visibility("hidden"))) static void *sc1_report_thread(void *arg) {
+  auto *holder = static_cast<std::shared_ptr<DeckHidraw> *>(arg);
+  std::shared_ptr<DeckHidraw> self = *holder;
+  delete holder;
+  uint32_t packet = 0;
+  SnapshotState snap;
+  uint32_t buttons = 0;
+  int32_t axes[8] = {};
+  DeckExtras extras;
+  while (live_pad_type() == PAD_TYPE_STEAM_2015) {
+    if (read_snapshot(self->ring, snap) && snap.generation == ring_generation(self->ring)) {
+      buttons = snap.buttons;
+      memcpy(axes, snap.axes, sizeof(axes));
+    }
+    read_deck_extras(*self, extras);
+    uint8_t report[DECK_REPORT_BYTES];
+    build_sc1_report(report, ++packet, buttons, axes, extras);
+    if (send(self->peer, report, sizeof(report), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
+        errno != EAGAIN && errno != EWOULDBLOCK)
+      break;
+    sleep_us(controller_report_interval_us(DECK_REPORT_INTERVAL_US));
+  }
+  syscall(SYS_close, self->peer);
+  munmap(self->ring, self->mapping_size);
+  return nullptr;
+}
+
+__attribute__((visibility("hidden"))) static int open_deck_hidraw('''
+
+patch(cpp, [
+    ('  bool emulated = false;\n  uint8_t sony = 0;\n};',
+     '  bool emulated = false;\n  uint8_t sony = 0;\n  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n};',
+     'bool sc1 = false;'),
+    ('PAD_TYPE_DUALSENSE_EDGE = 5, PAD_TYPE_LAST = PAD_TYPE_DUALSENSE_EDGE;',
+     'PAD_TYPE_DUALSENSE_EDGE = 5,\n'
+     '                          PAD_TYPE_STEAM_2015 = 6, PAD_TYPE_LAST = PAD_TYPE_STEAM_2015;',
+     'PAD_TYPE_STEAM_2015 = 6'),
+    ('static constexpr const char *DUALSENSE_EDGE_HIDRAW_PATH = "/dev/hidraw22";\n',
+     'static constexpr const char *DUALSENSE_EDGE_HIDRAW_PATH = "/dev/hidraw22";\n'
+     'static constexpr const char *SC1_HIDRAW_PATH = "/dev/hidraw23";\n'
+     'static constexpr unsigned int SC1_HIDRAW_MINOR = 23;\n'
+     'static constexpr const char *SC1_NAME = "Valve Software Steam Controller";\n'
+     'static constexpr const char *SC1_SERIAL = "DROIDDECKSC15";\n'
+     '\n'
+     '__attribute__((visibility("hidden"))) static bool is_sc1_hidraw_path(const char *pathname) {\n'
+     '  return pathname && fake_deck_enabled() && !strcmp(pathname, SC1_HIDRAW_PATH) &&\n'
+     '         live_pad_type() == PAD_TYPE_STEAM_2015;\n'
+     '}\n',
+     'is_sc1_hidraw_path(const char *pathname) {'),
+    ('__attribute__((visibility("hidden"))) static int open_deck_hidraw(int flags, uint8_t sony = 0) {\n'
+     '  const char *path = sony == 4',
+     SC1_CODE + 'int flags, uint8_t sony = 0, bool sc1 = false) {\n'
+     '  const char *path = sc1 ? SC1_HIDRAW_PATH : sony == 4',
+     'bool sc1 = false) {'),
+    ('  deck->sony = sony;\n',
+     '  deck->sony = sony;\n  deck->sc1 = sc1;\n',
+     'deck->sc1 = sc1;'),
+    ('sony ? sony_report_thread : deck_report_thread',
+     'sony ? sony_report_thread : sc1 ? sc1_report_thread : deck_report_thread',
+     'sc1 ? sc1_report_thread'),
+    ('sony == 6 ? " (a DualSense Edge)" : "");',
+     'sony == 6 ? " (a DualSense Edge)" : sc1 ? " (a Steam Controller 2015)" : "");',
+     '" (a Steam Controller 2015)"'),
+    # open() and openat()
+    ('  if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);\n',
+     '  if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);\n'
+     '  if (is_sc1_hidraw_path(pathname)) return open_deck_hidraw(flags, 0, true);\n',
+     'if (is_sc1_hidraw_path(pathname)) return open_deck_hidraw(flags, 0, true);', 2),
+    # stat(path)
+    ('      ((is_deck_hidraw_path(pathname) || is_triton_hidraw_path(pathname) || is_triton_pad_path(pathname) ||\n'
+     '        sony_pad_path(pathname)) && !process_is_steam_client())) {',
+     '      ((is_deck_hidraw_path(pathname) || is_triton_hidraw_path(pathname) || is_triton_pad_path(pathname) ||\n'
+     '        sony_pad_path(pathname) || is_sc1_hidraw_path(pathname)) && !process_is_steam_client())) {',
+     'sony_pad_path(pathname) || is_sc1_hidraw_path(pathname)) && !process_is_steam_client()'),
+    ('    statbuf->st_rdev = makedev(DECK_HIDRAW_MAJOR, DECK_HIDRAW_MINOR);\n    return 0;\n  }\n',
+     '    statbuf->st_rdev = makedev(DECK_HIDRAW_MAJOR, DECK_HIDRAW_MINOR);\n    return 0;\n  }\n'
+     '  if (is_sc1_hidraw_path(pathname)) {\n'
+     '    memset(statbuf, 0, sizeof(*statbuf));\n'
+     '    statbuf->st_mode = S_IFCHR | 0666;\n'
+     '    statbuf->st_rdev = makedev(DECK_HIDRAW_MAJOR, SC1_HIDRAW_MINOR);\n'
+     '    return 0;\n'
+     '  }\n',
+     'makedev(DECK_HIDRAW_MAJOR, SC1_HIDRAW_MINOR);\n    return 0;'),
+    # fstat(fd)
+    ('                       : device.triton ? TRITON_HIDRAW_MINOR : DECK_HIDRAW_MINOR;',
+     '                       : device.triton ? TRITON_HIDRAW_MINOR\n'
+     '                       : device.sc1 ? SC1_HIDRAW_MINOR : DECK_HIDRAW_MINOR;',
+     'device.sc1 ? SC1_HIDRAW_MINOR'),
+    # access() and faccessat()
+    ('  if (is_deck_hidraw_path(pathname) && process_is_steam_client()) return 0;\n',
+     '  if (is_deck_hidraw_path(pathname) && process_is_steam_client()) return 0;\n'
+     '  if (is_sc1_hidraw_path(pathname) && process_is_steam_client()) return 0;\n',
+     'if (is_sc1_hidraw_path(pathname) && process_is_steam_client()) return 0;', 2),
+    ('  if (is_withdrawn_pad_path(pathname) || is_deck_hidraw_path(pathname) || is_triton_hidraw_path(pathname) ||\n',
+     '  if (is_withdrawn_pad_path(pathname) || is_deck_hidraw_path(pathname) || is_sc1_hidraw_path(pathname) ||\n'
+     '      is_triton_hidraw_path(pathname) ||\n',
+     'is_deck_hidraw_path(pathname) || is_sc1_hidraw_path(pathname) ||', 2),
+    # identity over ioctl
+    ('static_cast<int16_t>(0x1205)',
+     'static_cast<int16_t>(deck.sc1 ? 0x1102 : 0x1205)',
+     'deck.sc1 ? 0x1102 : 0x1205'),
+    ('  case 0x04: return copy_ioctl_string(op, argp, DECK_NAME);',
+     '  case 0x04: return copy_ioctl_string(op, argp, deck.sc1 ? SC1_NAME : DECK_NAME);',
+     'deck.sc1 ? SC1_NAME : DECK_NAME'),
+    ('"usb-droiddeck-1/input2"',
+     'deck.sc1 ? "usb-droiddeck-7/input2" : "usb-droiddeck-1/input2"',
+     '"usb-droiddeck-7/input2"'),
+    ('  case 0x08: return copy_ioctl_string(op, argp, DECK_SERIAL);',
+     '  case 0x08: return copy_ioctl_string(op, argp, deck.sc1 ? SC1_SERIAL : DECK_SERIAL);',
+     'deck.sc1 ? SC1_SERIAL : DECK_SERIAL);'),
+    # feature reports: product-id attribute, serial, and haptic pulses
+    ('    memcpy(reply, kAttributes, sizeof(kAttributes));\n',
+     '    memcpy(reply, kAttributes, sizeof(kAttributes));\n'
+     '    if (deck.sc1) {  // ATTRIB_PRODUCT_ID = 0x1102\n'
+     '      reply[4] = 0x02;\n'
+     '      reply[5] = 0x11;\n'
+     '    }\n',
+     'ATTRIB_PRODUCT_ID = 0x1102'),
+    ('    memcpy(reply + 4, DECK_SERIAL, strlen(DECK_SERIAL));',
+     '    memcpy(reply + 4, deck.sc1 ? SC1_SERIAL : DECK_SERIAL, strlen(deck.sc1 ? SC1_SERIAL : DECK_SERIAL));',
+     'deck.sc1 ? SC1_SERIAL : DECK_SERIAL, strlen('),
+    ('      send_vibration(left, right, left || right ? 1000 : 0, 0);\n    }\n'
+     '    if (buf[1] == DECK_SET_SETTINGS_VALUES && size >= 3) {\n',
+     '      send_vibration(left, right, left || right ? 1000 : 0, 0);\n    }\n'
+     '    // Steam rumbles / identifies a 2015 Steam Controller with trackpad haptic pulses (0x8f: side,\n'
+     '    // on-us, off-us, repeat). Forward the long ones as rumble; short ones are trackpad ticks.\n'
+     '    if (deck.sc1 && buf[1] == 0x8f && size >= 10) {\n'
+     '      int on_us = buf[4] | buf[5] << 8, off_us = buf[6] | buf[7] << 8, repeat = buf[8] | buf[9] << 8;\n'
+     '      long total_ms = static_cast<long>(on_us + off_us) * std::max(1, repeat) / 1000;\n'
+     '      if (total_ms >= 20) send_vibration(0, 40000, static_cast<uint16_t>(std::min(1000L, total_ms)), 0);\n'
+     '    }\n'
+     '    if (buf[1] == DECK_SET_SETTINGS_VALUES && size >= 3) {\n',
+     'deck.sc1 && buf[1] == 0x8f'),
+    # pad-type switching (udev add/remove + hidraw watchers)
+    ('static constexpr const char *TRITON_PAD_DEVPATH = "/devices/droiddeck/usb3/3-1:1.0/0003:28DE:1302.0004/hidraw/hidraw19";\n',
+     'static constexpr const char *TRITON_PAD_DEVPATH = "/devices/droiddeck/usb3/3-1:1.0/0003:28DE:1302.0004/hidraw/hidraw19";\n'
+     'static constexpr const char *SC1_DEVPATH = "/devices/droiddeck/usb7/7-1:1.2/0003:28DE:1102.0008/hidraw/hidraw23";\n',
+     'SC1_DEVPATH ='),
+    ('  if (type == PAD_TYPE_STEAM)\n    return inject_uevent(action, TRITON_PAD_DEVPATH',
+     '  if (type == PAD_TYPE_STEAM_2015)\n'
+     '    return inject_uevent(action, SC1_DEVPATH, "hidraw", SC1_HIDRAW_PATH, DECK_HIDRAW_MAJOR, SC1_HIDRAW_MINOR);\n'
+     '  if (type == PAD_TYPE_STEAM)\n    return inject_uevent(action, TRITON_PAD_DEVPATH',
+     'inject_uevent(action, SC1_DEVPATH'),
+    ('       : type == PAD_TYPE_STEAM ? TRITON_PAD_HIDRAW_MINOR : DECK_HIDRAW_MINOR;',
+     '       : type == PAD_TYPE_STEAM ? TRITON_PAD_HIDRAW_MINOR\n'
+     '       : type == PAD_TYPE_STEAM_2015 ? SC1_HIDRAW_MINOR : DECK_HIDRAW_MINOR;',
+     'type == PAD_TYPE_STEAM_2015 ? SC1_HIDRAW_MINOR'),
+    ('"DualSense", "DualSense Edge"};',
+     '"DualSense", "DualSense Edge",\n                                 "Steam Controller (2015)"};',
+     '"Steam Controller (2015)"};'),
+    ('kNames[was % 6]',
+     'kNames[was % 7]',
+     'kNames[was % 7]'),
+])
+sys.stdout.write("OK\n")
+PY
+  then ok "Steam Controller 2015 pad type (28de:1102, /dev/hidraw23)"
+  else die "Steam Controller 2015 patch failed: an upstream anchor moved (see ANCHOR-MISS above)."
+  fi
+else
+  warn "fakeinput_steam.cpp / SteamDeckPad.kt / FakeInputWriter.java not found (skipping Steam Controller 2015)"
 fi
 
 echo
