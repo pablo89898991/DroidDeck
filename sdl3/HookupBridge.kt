@@ -66,6 +66,17 @@ object HookupBridge {
     private const val S_OUT = 41984
 
     @Volatile private var map: MappedByteBuffer? = null
+    @Volatile private var logFile: File? = null
+
+    /** Also written to the session's pad.log, next to the native side's "hookup:" lines. */
+    private fun note(line: String) {
+        Log.i(TAG, line)
+        val f = logFile ?: return
+        try {
+            val t = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date())
+            f.appendText("$t app: $line\n")
+        } catch (_: Exception) {}
+    }
     private val present = BooleanArray(SLOTS)
     private val getAsked = LongArray(SLOTS)
     @Volatile var tritonPassthrough = false
@@ -73,7 +84,8 @@ object HookupBridge {
 
     /** Creates the shared file; returns it for FAKE_HOOKUP_SHM. Called at session start. */
     @JvmStatic
-    fun prepare(fakeInputDir: File): File? = try {
+    fun prepare(fakeInputDir: File, padLog: File? = null): File? = try {
+        logFile = padLog
         val file = File(fakeInputDir, FILE)
         file.delete()
         RandomAccessFile(file, "rw").use { raf ->
@@ -87,9 +99,10 @@ object HookupBridge {
         file.setReadable(true, false)
         file.setWritable(true, false)
         present.fill(false)
+        note("hookup: shared file ready (${file.path}); waiting for the SDL3 bridge to hand over controllers")
         file
     } catch (e: Exception) {
-        Log.w(TAG, "hookup: no shared file: $e")
+        note("hookup: no shared file: $e")
         map = null
         null
     }
@@ -119,7 +132,11 @@ object HookupBridge {
 
     @Synchronized
     fun add(id: Bundle) {
-        val m = map ?: return
+        val m = map ?: run {
+            Log.w(TAG, "hookup: the bridge handed over a controller but this session has no hook-up file " +
+                "(DroidDeck build without it, or the session started without the deck pad)")
+            return
+        }
         val slot = id.getInt("slot", -1)
         if (slot !in 0 until SLOTS) return
         val base = slotBase(slot)
@@ -147,8 +164,8 @@ object HookupBridge {
         m.putInt(base + S_PRESENT, 1)
         present[slot] = true
         updateFfToSteam()
-        Log.i(TAG, "hookup: /dev/hidraw${MINOR_BASE + slot} = %04x:%04x \"%s\" (Steam Native Hook-up)"
-            .format(id.getInt("vid"), id.getInt("pid"), id.getString("name")))
+        note("hookup: /dev/hidraw${MINOR_BASE + slot} = %04x:%04x \"%s\" interface %d, descriptor %d bytes (Steam Native Hook-up)"
+            .format(id.getInt("vid"), id.getInt("pid"), id.getString("name"), id.getInt("iface"), desc.size))
     }
 
     @Synchronized
@@ -175,7 +192,7 @@ object HookupBridge {
         if (slot !in 0 until SLOTS) return
         m.putInt(slotBase(slot) + S_PRESENT, 0)
         FakeInputWriter.storeFence()
-        if (present[slot]) Log.i(TAG, "hookup: /dev/hidraw${MINOR_BASE + slot} unplugged")
+        if (present[slot]) note("hookup: /dev/hidraw${MINOR_BASE + slot} unplugged")
         present[slot] = false
         unlinkClass(slot)
         updateFfToSteam()
@@ -240,9 +257,13 @@ object HookupBridge {
     }
 
     private fun describeSysfs(slot: Int, id: Bundle, desc: ByteArray) {
-        val devices = com.droiddeck.launcher.session.SteamDeckPad.sysDevicesDir ?: return
-        val classDir = com.droiddeck.launcher.session.SteamDeckPad.sysHidrawClassDir ?: return
-        val context = com.droiddeck.launcher.session.SteamDeckPad.sysContext ?: return
+        val devices = com.droiddeck.launcher.session.SteamDeckPad.sysDevicesDir
+        val classDir = com.droiddeck.launcher.session.SteamDeckPad.sysHidrawClassDir
+        val context = com.droiddeck.launcher.session.SteamDeckPad.sysContext
+        if (devices == null || classDir == null || context == null) {
+            note("hookup: no session sysfs to describe /dev/hidraw${MINOR_BASE + slot} in (deck pad off?)")
+            return
+        }
         try {
             val (usb, iface, hid) = guestHid(slot, id)
             fun dir(guest: String) = File(devices, guest.removePrefix("/sys/devices/droiddeck/")).apply { mkdirs() }
@@ -296,7 +317,7 @@ object HookupBridge {
             val udevData = File(LinuxRuntime.rootDir(context), "run/udev/data").apply { mkdirs() }
             File(udevData, "c$MAJOR:$minor").writeText("I:1\nE:ID_INPUT=1\nE:ID_INPUT_JOYSTICK=1\n")
         } catch (e: Exception) {
-            Log.w(TAG, "hookup: could not describe /dev/hidraw${MINOR_BASE + slot}: $e")
+            note("hookup: could not describe /dev/hidraw${MINOR_BASE + slot}: $e")
         }
     }
 

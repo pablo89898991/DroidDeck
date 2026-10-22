@@ -1041,7 +1041,7 @@ patch(sdp, '            hidrawClassDir = hidrawClass\n',
       'sysDevicesDir = devices')
 patch(svc, '                guest.add("FAKE_DECK_SYSFS_LISTING=" + SteamDeckPad.listingDir(fakeInputDir.parentFile!!.parentFile!!).path)\n',
       '                if (com.droiddeck.launcher.input.HookupBridge.wanted(this))\n'
-      '                    com.droiddeck.launcher.input.HookupBridge.prepare(fakeInputDir)?.let { guest.add("FAKE_HOOKUP_SHM=" + it.path) }\n'
+      '                    com.droiddeck.launcher.input.HookupBridge.prepare(fakeInputDir, File(sessionDir, "pad.log"))?.let { guest.add("FAKE_HOOKUP_SHM=" + it.path) }\n'
       '                guest.add("FAKE_DECK_SYSFS_LISTING=" + SteamDeckPad.listingDir(fakeInputDir.parentFile!!.parentFile!!).path)\n',
       'FAKE_HOOKUP_SHM=')
 print("OK")
