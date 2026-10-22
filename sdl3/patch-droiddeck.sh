@@ -387,10 +387,10 @@ patch(cpp, [
      'type == PAD_TYPE_DUALSENSE_EDGE ? DUALSENSE_EDGE_HIDRAW_MINOR'),
     ('                                 "DualShock 4", "DualSense"};',
      '                                 "DualShock 4", "DualSense", "DualSense Edge"};',
-     ('"DualSense", "DualSense Edge"}', '"Steam Controller (2015)"}')),
+     ('"DualSense", "DualSense Edge"}', '"Steam Controller (2015)"}', '"no pad"}')),
     ('kNames[was % 5]',
      'kNames[was % 6]',
-     ('kNames[was % 6]', 'kNames[was % 7]')),
+     ('kNames[was % 6]', 'kNames[was % 7]', 'kNames[was % 8]')),
     # Sony touchpad (DualShock 4, DualSense, DualSense Edge): one full-width multitouch surface, never
     # the Deck's two halves. A real Sony pad is a single surface where finger 0 is the primary touch,
     # so confining finger 1 to the right half loses any touch that lands on it alone. put_sony_touch is
@@ -551,7 +551,8 @@ def patch(path, edits):
     for edit in edits:
         old, new, marker = edit[0], edit[1], edit[2]
         want = edit[3] if len(edit) > 3 else 1
-        if marker in s:
+        markers = marker if isinstance(marker, tuple) else (marker,)
+        if any(m in s for m in markers):
             continue  # already applied (idempotent)
         n = s.count(old)
         if n != want:
@@ -852,10 +853,10 @@ patch(cpp, [
      'type == PAD_TYPE_STEAM_2015 ? SC1_HIDRAW_MINOR'),
     ('"DualSense", "DualSense Edge"};',
      '"DualSense", "DualSense Edge",\n                                 "Steam Controller (2015)"};',
-     '"Steam Controller (2015)"};'),
+     ('"Steam Controller (2015)"};', '"Steam Controller (2015)", "no pad"};')),
     ('kNames[was % 6]',
      'kNames[was % 7]',
-     'kNames[was % 7]'),
+     ('kNames[was % 7]', 'kNames[was % 8]')),
 ])
 sys.stdout.write("OK\n")
 PY
@@ -1180,6 +1181,48 @@ PY
   fi
 else
   warn "PerformanceDialog.kt / MainActivity.kt not found (skipping Performance page switch)"
+fi
+
+# ---------- 18. Steam Native Hook-up: no extra Steam Deck pad next to the real controller ----------
+# While controllers are handed to Steam (and no bridged gamepad needs it), DroidDeck's own Steam Deck pad
+# is withdrawn (pad type 7 = none), so the real controller is player 1 -- like plugging it into a PC.
+CPP="$DD/app/src/main/cpp/fakeinput_steam.cpp"
+FIW="$IN/FakeInputWriter.java"
+if [ -f "$CPP" ] && [ -f "$FIW" ]; then
+  if python3 - "$CPP" "$FIW" <<'PY'
+import sys
+cpp, fiw = sys.argv[1], sys.argv[2]
+def patch(path, edits):
+    s = open(path, encoding='utf-8').read()
+    for old, new, marker in edits:
+        if marker in s:
+            continue
+        if s.count(old) != 1:
+            sys.stderr.write("ANCHOR-MISS %s :: %r (found %d)\n" % (path, old[:70], s.count(old)))
+            sys.exit(3)
+        s = s.replace(old, new, 1)
+    open(path, 'w', encoding='utf-8').write(s)
+patch(cpp, [
+    ('PAD_TYPE_STEAM_2015 = 6, PAD_TYPE_LAST = PAD_TYPE_STEAM_2015;',
+     'PAD_TYPE_STEAM_2015 = 6,\n                          PAD_TYPE_NONE = 7, PAD_TYPE_LAST = PAD_TYPE_NONE;',
+     'PAD_TYPE_NONE = 7'),
+    ('__attribute__((visibility("hidden"))) static int pad_type_uevent(uint32_t type, const char *action) {\n',
+     '__attribute__((visibility("hidden"))) static int pad_type_uevent(uint32_t type, const char *action) {\n'
+     '  if (type == PAD_TYPE_NONE) return 0;  // sdl3bridge: no pad (real controllers handed to Steam)\n',
+     'if (type == PAD_TYPE_NONE) return 0;'),
+    ('"Steam Controller (2015)"};', '"Steam Controller (2015)", "no pad"};', '"no pad"};'),
+    ('kNames[was % 7]', 'kNames[was % 8]', 'kNames[was % 8]'),
+])
+patch(fiw, [
+    ('    public static final int PAD_TYPE_STEAM_2015 = 6;\n',
+     '    public static final int PAD_TYPE_STEAM_2015 = 6;\n    public static final int PAD_TYPE_NONE = 7;\n',
+     'PAD_TYPE_NONE = 7'),
+])
+print("OK")
+PY
+  then ok "pad type 'none' while controllers are handed to Steam"
+  else die "pad type none: an upstream anchor moved (see ANCHOR-MISS above)."
+  fi
 fi
 
 echo
