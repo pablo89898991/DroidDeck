@@ -161,6 +161,7 @@ object DualSenseBridge {
     private val rumbleTimer = Handler(worker.looper)
     private val rumbleStop = arrayOfNulls<Runnable>(SLOTS)
     private const val RUMBLE_HOLD_MS = 0xFFFF   // matches RumbleComponent.HOLD_MS
+    private const val HOLD_SAFETY_MS = 30_000L
 
     @JvmStatic
     fun rumble(strong: Int, weak: Int) = rumble(0, strong, weak, RUMBLE_HOLD_MS)
@@ -170,8 +171,8 @@ object DualSenseBridge {
 
     /**
      * Rumble for a DroidDeck player slot (0 = player 1), honoring the effect duration [ms].
-     * HOLD effects (0xFFFF) and gameplay buzzes expire after a short window and are refreshed by the
-     * next buzz; a one-shot (e.g. the controller "ping") plays for its own duration and then stops.
+     * HOLD effects (0xFFFF) play until the explicit stop that follows them (30 s safety cap); a timed
+     * one-shot (e.g. the controller "ping") plays for its own duration and then stops.
      */
     @JvmStatic
     fun rumble(deckSlot: Int, strong: Int, weak: Int, ms: Int) {
@@ -180,7 +181,9 @@ object DualSenseBridge {
             rumbleStop[bridgeSlot]?.let { rumbleTimer.removeCallbacks(it); rumbleStop[bridgeSlot] = null }
             sendRumble(bridgeSlot, strong, weak)
             if (strong == 0 && weak == 0) return@post
-            val hold = if (ms == RUMBLE_HOLD_MS || ms <= 0) 2000L else ms.toLong().coerceIn(1L, 5000L)
+            // HOLD = play until the game's/Steam's explicit stop (they always send one); the long cap is only a
+            // safety net in case that stop is lost (e.g. the game crashes mid-rumble).
+            val hold = if (ms == RUMBLE_HOLD_MS || ms <= 0) HOLD_SAFETY_MS else ms.toLong().coerceIn(1L, 5000L)
             val stop = Runnable { sendRumble(bridgeSlot, 0, 0); rumbleStop[bridgeSlot] = null }
             rumbleStop[bridgeSlot] = stop
             rumbleTimer.postDelayed(stop, hold)
@@ -236,6 +239,47 @@ object DualSenseBridge {
         }
         return false
     }
+
+    /**
+     * Called first thing in RumbleComponent.buzz(). Returns true when the effect was sent to a bridged
+     * controller (and must NOT also go to the phone / an Android pad).
+     *
+     *  - slot 0..3: a DroidDeck player slot -> its bridged controller, if one drives it.
+     *  - slot >= PadBridge.SLOTS (e.g. 16): a game rumbling Steam's VIRTUAL pad. Upstream sends that to the
+     *    "last active Android controller", which is nobody while the bridge holds the pad, so it fell back to
+     *    the phone's vibrator. Route it to player 1's bridged controller instead (unless a real Android pad is
+     *    the active one, or it is a SteamVR Joy-Con hand slot).
+     */
+    @JvmStatic
+    fun routeRumble(slot: Int, strong: Int, weak: Int, ms: Int): Boolean {
+        val deckSlot = when {
+            slot in 0 until PadBridge.SLOTS -> if (isBridgedSlot(slot)) slot else return false
+            JoyCon.vrRumbleDevice(slot) != null -> return false
+            !isBridgedSlot(0) -> return false
+            else -> {
+                val id = PadBridge.activeControllerId()
+                if (id != PadBridge.NO_CONTROLLER) {
+                    val dev = InputDevice.getDevice(id)
+                    // a real Android pad with motors is in use: leave it to upstream
+                    if (dev != null && !isBridged(dev) && hasMotors(dev)) return false
+                }
+                0
+            }
+        }
+        val on = (strong != 0 || weak != 0) && ms != 0   // ms == 0 is a stop, as in RumbleComponent
+        if (on != rumbleLogged) {
+            rumbleLogged = on
+            android.util.Log.i("SessionService", "rumble: slot $slot -> SDL3 bridge (player ${deckSlot + 1}) ${if (on) "on ${strong shr 8}/${weak shr 8} ${ms}ms" else "off"}")
+        }
+        if (on) rumble(deckSlot, strong shr 8, weak shr 8, ms) else rumble(deckSlot, 0, 0, 0)
+        return true
+    }
+    @Volatile private var rumbleLogged = false
+
+    private fun hasMotors(dev: InputDevice): Boolean = try {
+        if (android.os.Build.VERSION.SDK_INT >= 31) dev.vibratorManager.vibratorIds.isNotEmpty()
+        else @Suppress("DEPRECATION") dev.vibrator.hasVibrator()
+    } catch (_: Exception) { false }
 
     @JvmStatic fun isBridged(e: KeyEvent): Boolean = isBridged(e.device)
     @JvmStatic fun isBridged(e: MotionEvent): Boolean = isBridged(e.device)

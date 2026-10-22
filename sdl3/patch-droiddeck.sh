@@ -229,13 +229,13 @@ fi
 # ---------- 8. RumbleComponent: route rumble to the bridged controller (not the phone) ----------
 RC="$DD/app/src/main/java/com/droiddeck/launcher/session/RumbleComponent.kt"
 if [ -f "$RC" ]; then
-  if grep -q "DualSenseBridge.isBridgedSlot" "$RC"; then
+  if grep -q "DualSenseBridge.routeRumble" "$RC"; then
     skip "RumbleComponent bridge routing"
   elif grep -q "if (!enabled) return" "$RC"; then
-    sed -i '/if (!enabled) return/a\        if (com.droiddeck.launcher.input.DualSenseBridge.isBridgedSlot(slot)) { com.droiddeck.launcher.input.DualSenseBridge.rumble(slot, strong shr 8, weak shr 8, ms); return }' "$RC"
-    grep -q "DualSenseBridge.isBridgedSlot" "$RC" && ok "RumbleComponent bridge routing" || warn "RumbleComponent hook NOT inserted"
+    sed -i '/if (!enabled) return/a\        if (com.droiddeck.launcher.input.DualSenseBridge.routeRumble(slot, strong, weak, ms)) return' "$RC"
+    grep -q "DualSenseBridge.routeRumble" "$RC" && ok "RumbleComponent bridge routing" || warn "RumbleComponent hook NOT inserted"
   else
-    warn "RumbleComponent: add a DualSenseBridge.isBridgedSlot(slot) check at the top of buzz()"
+    warn "RumbleComponent: add a DualSenseBridge.routeRumble(slot, strong, weak, ms) check at the top of buzz()"
   fi
 else
   warn "RumbleComponent.kt not found (skipping rumble routing)"
@@ -398,14 +398,6 @@ patch(cpp, [
      '  int px = side * half + (static_cast<int>(x) + 32768) * (half - 1) / 65535;',
      '  int px = (static_cast<int>(x) + 32768) * (SONY_TOUCH_WIDTH - 1) / 65535;',
      'int px = (static_cast<int>(x) + 32768) * (SONY_TOUCH_WIDTH - 1) / 65535;'),
-    # TEMP DIAGNOSTIC: log the Sony touch state on change so we can see whether finger 1 (the right pad)
-    # reaches the report. Remove once the multitouch bug is found.
-    ('  bool left = extras.controls & DECK_EXTRA_LPAD_TOUCH, right = extras.controls & DECK_EXTRA_RPAD_TOUCH;',
-     '  bool left = extras.controls & DECK_EXTRA_LPAD_TOUCH, right = extras.controls & DECK_EXTRA_RPAD_TOUCH;\n'
-     '  { static int dbg__ = -1; int cur__ = (left ? 1 : 0) | (right ? 2 : 0); if (cur__ != dbg__) { dbg__ = cur__;\n'
-     '    Logger::log("sonytouch L=%d R=%d padL=(%d,%d) padR=(%d,%d)\\n", left ? 1 : 0, right ? 1 : 0,\n'
-     '                (int) extras.pads[0], (int) extras.pads[1], (int) extras.pads[2], (int) extras.pads[3]); } }',
-     'sonytouch L=%d'),
 ])
 sys.stdout.write("OK\n")
 PY
@@ -466,6 +458,75 @@ if [ -f "$GRADLE" ]; then
   fi
 else
   warn "app/build.gradle not found (skipping unit-test guard)"
+fi
+
+# ---------- 12. Sony rumble: decode what Steam/SDL actually send, and honor stops ----------
+# Upstream only treated a DualSense effects report as rumble when enable-bits1 had 0x01/0x02. Firmware
+# >= 2.24 and every DualSense Edge use SDL's "enhanced rumble" (enable-bits3 0x04 at byte 39), and the
+# motors-off report clears all of those bits -- so stops were ignored and every buzz ran a fixed 2 s.
+# Now: rumble bits present -> motors as sent, held until the next report; bits absent -> motors off.
+# The first ~40 motor changes are written to pad.log ("sony: out ...") so a session log shows the path.
+CPP="$DD/app/src/main/cpp/fakeinput_steam.cpp"
+if [ -f "$CPP" ]; then
+  if python3 - "$CPP" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+if "sdl3bridge: sony rumble v2" not in s:
+    old = ('  int weak, strong;\n'
+           '  if (pad.sony == 4 && data[0] == 0x05) {\n'
+           '    if (!(data[1] & 0x01)) return;\n'
+           '    weak = data[4];\n'
+           '    strong = data[5];\n'
+           '  } else if ((pad.sony == 5 || pad.sony == 6) && data[0] == 0x02) {\n'
+           '    if (!(data[1] & 0x03)) return;\n'
+           '    weak = data[3];\n'
+           '    strong = data[4];\n'
+           '  } else {\n'
+           '    return;\n'
+           '  }\n'
+           '  send_vibration(strong * 257, weak * 257, strong || weak ? 2000 : 0, 0);\n')
+    new = ('  // sdl3bridge: sony rumble v2\n'
+           '  static int last_strong = -1, last_weak = -1;\n'
+           '  static unsigned logged = 0;\n'
+           '  int weak = 0, strong = 0;\n'
+           '  if (pad.sony == 4 && data[0] == 0x05) {\n'
+           '    if (!(data[1] & 0x01)) return;  // DS4: motors untouched by this report\n'
+           '    weak = data[4];\n'
+           '    strong = data[5];\n'
+           '  } else if ((pad.sony == 5 || pad.sony == 6) && data[0] == 0x02) {\n'
+           '    // [1] enable bits1 (0x01 rumble emulation, 0x02 haptics off), [3] right/weak, [4] left/strong,\n'
+           '    // [39] enable bits3 (0x04 = improved rumble, fw >= 2.24 / Edge). Full state is re-sent every\n'
+           '    // report, and the bits are cleared once the motors stop: no bits = motors off.\n'
+           '    bool rumble = (data[1] & 0x03) || (size > 39 && (data[39] & 0x04));\n'
+           '    if (rumble) {\n'
+           '      weak = data[3];\n'
+           '      strong = data[4];\n'
+           '    }\n'
+           '  } else {\n'
+           '    return;\n'
+           '  }\n'
+           '  if (strong == last_strong && weak == last_weak) return;  // LED / repeat report: nothing changed\n'
+           '  if (logged < 40) {\n'
+           '    logged++;\n'
+           '    Logger::log("sony: out 0x%02x bits %02x/%02x motors %d/%d\\n", data[0], data[1],\n'
+           '                size > 39 ? data[39] : 0, strong, weak);\n'
+           '  }\n'
+           '  last_strong = strong;\n'
+           '  last_weak = weak;\n'
+           '  send_vibration(strong * 257, weak * 257, strong || weak ? RUMBLE_HOLD_MS : 0, 0);\n')
+    if s.count(old) != 1:
+        sys.stderr.write("ANCHOR-MISS sony_output body (found %d)\n" % s.count(old))
+        sys.exit(3)
+    s = s.replace(old, new, 1)
+    open(p, 'w', encoding='utf-8').write(s)
+sys.stdout.write("OK\n")
+PY
+  then ok "Sony rumble decode (enhanced rumble + stops)"
+  else die "Sony rumble patch failed: an upstream anchor moved (see ANCHOR-MISS above)."
+  fi
+else
+  warn "fakeinput_steam.cpp not found (skipping Sony rumble decode)"
 fi
 
 echo
