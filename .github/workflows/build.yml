@@ -101,6 +101,7 @@ jobs:
           persist-credentials: false
 
       - name: Check human authorship
+        if: github.repository == 'Droid-Deck/droiddeck'
         env:
           EVENT_NAME: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}

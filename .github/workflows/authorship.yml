@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   authorship:
+    if: github.repository == 'Droid-Deck/droiddeck'
     name: Validate human authorship
     runs-on: ubuntu-24.04
     timeout-minutes: 5
