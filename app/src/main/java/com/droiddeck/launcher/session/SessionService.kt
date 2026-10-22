@@ -1607,6 +1607,7 @@ class SessionService : Service() {
         SessionEvents.record("guest.exited", mapOf("status" to status))
         GpuClockPin.stop(this)
         GameThreadHints.stop()
+        com.droiddeck.launcher.input.DualSenseBridge.detach()
         SessionEvents.transition(SessionPhase.STOPPING, "session.stopping", mapOf("status" to status))
         suspendOperationPending = false
         launchWatcher?.stopWatching()
@@ -1680,6 +1681,7 @@ class SessionService : Service() {
     override fun onDestroy() {
         stopSession(0)
         GameThreadHints.stop() // also when the session never got as far as running
+        com.droiddeck.launcher.input.DualSenseBridge.detach()
         if (screenReceiverRegistered) {
             unregisterReceiver(screenReceiver)
             screenReceiverRegistered = false
