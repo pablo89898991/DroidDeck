@@ -1129,5 +1129,58 @@ else
   warn "SessionPrefs/SessionOverlay/SessionActivity/strings.xml not found (skipping Game thread boost switch)"
 fi
 
+# ---------- 17. "Game thread boost" switch in DroidDeck's Settings -> Performance page too ----------
+PD="$PKG/ui/PerformanceDialog.kt"
+MA="$PKG/MainActivity.kt"
+if [ -f "$PD" ] && [ -f "$MA" ]; then
+  if python3 - "$PD" "$MA" <<'PY'
+import sys
+pd, ma = sys.argv[1], sys.argv[2]
+def patch(path, edits):
+    s = open(path, encoding='utf-8').read()
+    for old, new, marker in edits:
+        if marker in s:
+            continue
+        if s.count(old) != 1:
+            sys.stderr.write("ANCHOR-MISS %s :: %r (found %d)\n" % (path, old[:70], s.count(old)))
+            sys.exit(3)
+        s = s.replace(old, new, 1)
+    open(path, 'w', encoding='utf-8').write(s)
+patch(pd, [
+    ('    gpuClockPin: Boolean,\n', '    gpuClockPin: Boolean,\n    gameThreadHints: Boolean = true,\n', 'gameThreadHints: Boolean = true,'),
+    ('    onGpuClockPin: (Boolean) -> Unit,\n', '    onGpuClockPin: (Boolean) -> Unit,\n    onGameThreadHints: (Boolean) -> Unit = {},\n',
+     'onGameThreadHints: (Boolean) -> Unit = {},'),
+    ('                gamescopeRealtime, onChange = onGamescopeRealtime,\n            )\n',
+     '                gamescopeRealtime, onChange = onGamescopeRealtime,\n            )\n'
+     '            ToggleRow(\n'
+     '                host, "gamethreadhints", stringResource(R.string.drawer_game_thread_hints),\n'
+     '                stringResource(R.string.drawer_game_thread_hints_hint),\n'
+     '                gameThreadHints, onChange = onGameThreadHints,\n'
+     '            )\n',
+     '"gamethreadhints"'),
+])
+patch(ma, [
+    ('    private var gpuClockPin by mutableStateOf(false)\n',
+     '    private var gpuClockPin by mutableStateOf(false)\n    private var gameThreadHints by mutableStateOf(true)\n',
+     'private var gameThreadHints by'),
+    ('            gpuClockPin = gpuClockPin,\n', '            gpuClockPin = gpuClockPin,\n            gameThreadHints = gameThreadHints,\n',
+     'gameThreadHints = gameThreadHints,'),
+    ('            onGpuClockPin = { on -> SessionPrefs.setGpuClockPin(this, on); gpuClockPin = on },\n',
+     '            onGpuClockPin = { on -> SessionPrefs.setGpuClockPin(this, on); gpuClockPin = on },\n'
+     '            onGameThreadHints = { on -> SessionPrefs.setGameThreadHints(this, on); gameThreadHints = on },\n',
+     'onGameThreadHints = { on ->'),
+    ('        gpuClockPin = SessionPrefs.gpuClockPin(this)\n',
+     '        gpuClockPin = SessionPrefs.gpuClockPin(this)\n        gameThreadHints = SessionPrefs.gameThreadHints(this)\n',
+     'gameThreadHints = SessionPrefs.gameThreadHints(this)'),
+])
+print("OK")
+PY
+  then ok "Settings -> Performance: Game thread boost switch"
+  else die "Performance page switch: an upstream anchor moved (see ANCHOR-MISS above)."
+  fi
+else
+  warn "PerformanceDialog.kt / MainActivity.kt not found (skipping Performance page switch)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
