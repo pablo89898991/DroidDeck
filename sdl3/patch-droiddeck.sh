@@ -1225,5 +1225,34 @@ PY
   fi
 fi
 
+# ---------- 19. Upstream's "human authorship" gate only on the upstream repository ----------
+# Upstream DroidDeck checks that commits to ITS repository are written by people. In this fork every
+# build starts from an automatic sync commit (sdl3-sync[bot]), which that gate rejects, so the build
+# stopped before compiling. Keep the check exactly as is for Droid-Deck/droiddeck and skip it here.
+# (If you ever send changes upstream, their policy applies: those must be your own commits.)
+AUTHYML="$DD/.github/workflows/authorship.yml"
+if [ -f "$BUILDYML" ] || [ -f "$AUTHYML" ]; then
+  if python3 - "$BUILDYML" "$AUTHYML" <<'PY'
+import sys, os
+build, auth = sys.argv[1], sys.argv[2]
+COND = "github.repository == 'Droid-Deck/droiddeck'"
+def patch(path, old, new):
+    if not os.path.exists(path):
+        return
+    s = open(path, encoding='utf-8').read()
+    if COND in s or old not in s:
+        return
+    open(path, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+patch(build, "      - name: Check human authorship\n",
+      "      - name: Check human authorship\n        if: " + COND + "\n")
+patch(auth, "  authorship:\n    name: Validate human authorship\n",
+      "  authorship:\n    if: " + COND + "\n    name: Validate human authorship\n")
+print("OK")
+PY
+  then ok "upstream authorship check limited to the upstream repo"
+  else warn "could not adjust the authorship check"
+  fi
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
