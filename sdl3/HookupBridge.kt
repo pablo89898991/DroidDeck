@@ -69,7 +69,7 @@ object HookupBridge {
     @Volatile private var logFile: File? = null
 
     /** Also written to the session's pad.log, next to the native side's "hookup:" lines. */
-    private fun note(line: String) {
+    internal fun note(line: String) {
         Log.i(TAG, line)
         val f = logFile ?: return
         try {
@@ -141,6 +141,10 @@ object HookupBridge {
         if (slot !in 0 until SLOTS) return
         val base = slotBase(slot)
         val desc = id.getByteArray("desc") ?: ByteArray(0)
+        if (present[slot] && (m.getShort(base + S_VENDOR).toInt() and 0xffff) == id.getInt("vid") &&
+            (m.getShort(base + S_PRODUCT).toInt() and 0xffff) == id.getInt("pid") && m.getInt(base + S_IFACE) == id.getInt("iface")) {
+            return   // the same controller resent after a reconnect: keep it as it is (no unplug/replug in Steam)
+        }
         if (present[slot]) remove(slot)
         describeSysfs(slot, id, desc)
         m.putShort(base + S_VENDOR, id.getInt("vid").toShort())

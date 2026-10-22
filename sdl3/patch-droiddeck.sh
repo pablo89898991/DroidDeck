@@ -150,7 +150,7 @@ if [ -f "$SA" ]; then
   if grep -q "DualSenseBridge.detach(" "$SA"; then
     skip "SessionActivity detach()"
   elif grep -q "padBridge?.stop()" "$SA"; then
-    sed -i '/padBridge?.stop()/a\        com.droiddeck.launcher.input.DualSenseBridge.detach()' "$SA"
+    sed -i '/padBridge?.stop()/a\        com.droiddeck.launcher.input.DualSenseBridge.detach(this)' "$SA"
     grep -q "DualSenseBridge.detach(" "$SA" && ok "SessionActivity detach()" || warn "SessionActivity detach() NOT inserted"
   else
     warn "SessionActivity: add  com.droiddeck.launcher.input.DualSenseBridge.detach()  where the session is destroyed"
