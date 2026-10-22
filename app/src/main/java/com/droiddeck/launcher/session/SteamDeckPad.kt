@@ -84,6 +84,10 @@ object SteamDeckPad {
 
     fun listingDir(sessionRoot: File) = File(sessionRoot, "sys/deck/listing")
 
+    // sdl3bridge: where the session sysfs lives, for HookupBridge (Steam Native Hook-up) hot-plug
+    @Volatile @JvmStatic var sysDevicesDir: File? = null
+    @Volatile @JvmStatic var sysHidrawClassDir: File? = null
+    @Volatile @JvmStatic var sysContext: Context? = null
     private val padNodes = mutableMapOf<Int, String>()
     @Volatile private var hidrawClassDir: File? = null
 
@@ -298,6 +302,9 @@ object SteamDeckPad {
             describeTriton(wired = true)
             if (triton) describeTriton(wired = false)
             hidrawClassDir = hidrawClass
+            sysDevicesDir = devices
+            sysHidrawClassDir = hidrawClass
+            sysContext = context.applicationContext
             showPad(padType)
 
             Log.i(TAG, "deck pad: /dev/$NODE described as a Steam Deck controller (28de:1205)")
