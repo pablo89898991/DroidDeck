@@ -47,6 +47,14 @@ object DualSenseBridge {
     private const val TRITON_SLOT = 0            // the ring slot DroidDeck's Steam Controller node reads
     private const val TRITON_STATE_BYTES = 45
     private const val TRITON_POLL_MS = 2L
+    // Steam Native Hook-up (see HookupBridge.kt and the bridge's hookup.h)
+    private const val MSG_HOOKUP_OUT = 7
+    private const val MSG_HOOKUP_GET = 8
+    private const val MSG_HOOKUP_ADD = 20
+    private const val MSG_HOOKUP_INPUT = 21
+    private const val MSG_HOOKUP_REMOVE = 22
+    private const val MSG_HOOKUP_REPLY = 23
+    private const val HOOKUP_POLL_MS = 1L
     private const val SLOTS = 4
 
     // ---- Tunables (verify on device) ----
@@ -130,6 +138,10 @@ object DualSenseBridge {
                     if (tritonOn) FakeInputWriter.writeTritonState(TRITON_SLOT, m.data.getInt("id"), it)
                 }
                 MSG_TRITON_CONN -> setTriton(m.data.getBoolean("on"), m.data.getString("what") ?: "")
+                MSG_HOOKUP_ADD -> { HookupBridge.add(m.data); startHookupPoll() }
+                MSG_HOOKUP_INPUT -> m.data.getByteArray("data")?.let { HookupBridge.input(m.data.getInt("slot"), it) }
+                MSG_HOOKUP_REMOVE -> HookupBridge.remove(m.data.getInt("slot"))
+                MSG_HOOKUP_REPLY -> HookupBridge.reply(m.data.getInt("slot"), m.data.getLong("request"), m.data.getByteArray("data"))
                 MSG_TRITON_FEATURE -> {
                     val request = m.data.getLong("request")
                     if (request == tritonFeatureAsked) FakeInputWriter.writeTritonFeatureReply(TRITON_SLOT, request, m.data.getByteArray("data"))
@@ -143,7 +155,10 @@ object DualSenseBridge {
             server = Messenger(b)
             send(Message.obtain(null, MSG_REGISTER).apply { replyTo = inbox })
         }
-        override fun onServiceDisconnected(n: ComponentName) { server = null; release(); workerHandler.post { setTriton(false, "bridge stopped") } }
+        override fun onServiceDisconnected(n: ComponentName) {
+            server = null; release()
+            workerHandler.post { setTriton(false, "bridge stopped"); HookupBridge.removeAll() }
+        }
     }
 
     /** @return false if the bridge app is not installed / not bindable. */
@@ -169,7 +184,7 @@ object DualSenseBridge {
             bound = false
         }
         release()
-        workerHandler.post { setTriton(false, "session ended") }
+        workerHandler.post { setTriton(false, "session ended"); HookupBridge.removeAll() }
         pad = null
         server = null
     }
@@ -206,10 +221,40 @@ object DualSenseBridge {
         }
     }
 
+    // ---------------- Steam Native Hook-up: Steam -> controller ----------------
+    private var hookupPolling = false
+    private val hookupPoll = object : Runnable {
+        override fun run() {
+            if (!HookupBridge.anyPresent()) { hookupPolling = false; return }
+            HookupBridge.poll(
+                { slot, kind, report ->
+                    send(Message.obtain(null, MSG_HOOKUP_OUT).apply {
+                        data = Bundle().apply { putInt("slot", slot); putInt("kind", kind); putByteArray("data", report) }
+                    })
+                },
+                { slot, request, id, input, length ->
+                    send(Message.obtain(null, MSG_HOOKUP_GET).apply {
+                        data = Bundle().apply {
+                            putInt("slot", slot); putLong("request", request); putInt("id", id)
+                            putBoolean("input", input); putInt("length", length)
+                        }
+                    })
+                })
+            workerHandler.postDelayed(this, HOOKUP_POLL_MS)
+        }
+    }
+
+    private fun startHookupPoll() {
+        if (hookupPolling) return
+        hookupPolling = true
+        workerHandler.post(hookupPoll)
+    }
+
     /** Runs on the worker thread. */
     private fun setTriton(on: Boolean, what: String) {
         if (on == tritonOn) return
         tritonOn = on
+        HookupBridge.tritonPassthrough = on
         workerHandler.removeCallbacks(tritonPoll)
         if (on) {
             tritonFeatureAsked = 0L
@@ -355,6 +400,10 @@ object DualSenseBridge {
      */
     @JvmStatic
     fun routeRumble(slot: Int, strong: Int, weak: Int, ms: Int): Boolean {
+        // A real controller Steam drives itself is connected (Steam Native Hook-up / Steam Controller
+        // passthrough): game rumble on Steam's virtual pad goes to Steam (fakeinput_steam.cpp hands it the
+        // uinput force-feedback request) and Steam rumbles that controller with its own driver.
+        if (slot >= PadBridge.SLOTS && JoyCon.vrRumbleDevice(slot) == null && HookupBridge.ffToSteam()) return true
         // Only a passed-through Steam Controller (2026), no bridged gamepad: player 1 / virtual-pad rumble -> it.
         if (tritonOn && !isBridgedSlot(0) && (slot == 0 || slot >= PadBridge.SLOTS) && JoyCon.vrRumbleDevice(slot) == null &&
             (slot == 0 || !realAndroidPadActive())) {

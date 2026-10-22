@@ -886,5 +886,173 @@ else
   warn "SessionService.kt not found (skipping Steam Controller passthrough node)"
 fi
 
+# ---------- 15. Steam Native Hook-up: the bridge hands Steam the REAL USB controller ----------
+# The SDL3 bridge can pass any USB controller SDL3 supports through raw (its real ids, name, serial, report
+# descriptor and every HID report). DroidDeck shows each as /dev/hidraw24..27 with a kernel-like sysfs
+# description, so Steam's own driver recognises the actual controller -- like on a PC. Game rumble is
+# handed to Steam through its virtual pad's uinput force feedback so Steam rumbles that controller itself.
+CPP="$DD/app/src/main/cpp/fakeinput_steam.cpp"
+SDP="$PKG/session/SteamDeckPad.kt"
+SVC="$PKG/session/SessionService.kt"
+[ -f "$SRC/HookupBridge.kt" ] || die "HookupBridge.kt is missing next to this script"
+[ -f "$SRC/hookup_native.inc" ] || die "hookup_native.inc is missing next to this script"
+if [ -f "$CPP" ] && [ -f "$SDP" ] && [ -f "$SVC" ]; then
+  cp "$SRC/HookupBridge.kt" "$IN/HookupBridge.kt" && ok "installed HookupBridge.kt"
+  if python3 - "$CPP" "$SRC/hookup_native.inc" <<'PY'
+import sys
+cpp, inc = sys.argv[1], sys.argv[2]
+MARK = "sdl3bridge: Steam Native Hook-up"
+s = open(cpp, encoding='utf-8').read()
+if MARK in s:
+    sys.stdout.write("OK\n")
+    sys.exit(0)
+block = open(inc, encoding='utf-8').read()
+
+def rep(old, new, want=1):
+    global s
+    n = s.count(old)
+    if n != want:
+        sys.stderr.write("ANCHOR-MISS hookup :: %r (found %d, expected %d)\n" % (old[:70], n, want))
+        sys.exit(3)
+    s = s.replace(old, new)
+
+rep('#include <vector>\n', '#include <vector>\n#include <deque>\n')
+# DeckHidraw: which hook-up slot a hidraw fd serves
+rep('  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n};',
+    '  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n'
+    '  int8_t hookup = -1;  // sdl3bridge: Steam Native Hook-up slot\n'
+    '  uint32_t hookup_generation = 0;\n};')
+# UinputWriter: force-feedback requests queued for Steam
+rep('  uint32_t buttons = 0;\n  int16_t axes[8] = {};\n};',
+    '  uint32_t buttons = 0;\n  int16_t axes[8] = {};\n'
+    '  std::deque<struct input_event> ff_queue;  // sdl3bridge: game rumble handed to Steam\n'
+    '  uint64_t ff_seen = 0;\n  uint32_t ff_request = 0;\n  struct ff_effect ff_effect = {};\n};')
+# game rumble on a virtual pad -> shared state for Steam
+rep('__attribute__((visibility("hidden"))) static void\nsend_vibration(int strong, int weak, uint16_t duration_ms, uint16_t slot) {\n',
+    'static void hookup_ff_from_game(uint16_t slot, int strong, int weak, uint16_t length);\n\n'
+    '__attribute__((visibility("hidden"))) static void\nsend_vibration(int strong, int weak, uint16_t duration_ms, uint16_t slot) {\n'
+    '  hookup_ff_from_game(slot, strong, weak, duration_ms);\n')
+# uinput force-feedback upload handshake answered for Steam
+rep('''  case _IOC_NR(UI_BEGIN_FF_UPLOAD):
+  case _IOC_NR(UI_END_FF_UPLOAD):
+  case _IOC_NR(UI_BEGIN_FF_ERASE):
+  case _IOC_NR(UI_END_FF_ERASE):
+    errno = EINVAL;
+    return -1;''', '''  case _IOC_NR(UI_BEGIN_FF_UPLOAD): {
+    auto *upload = static_cast<struct uinput_ff_upload *>(argp);
+    if (!upload || upload->request_id != w.ff_request) {
+      errno = EINVAL;
+      return -1;
+    }
+    upload->retval = 0;
+    upload->effect = w.ff_effect;
+    memset(&upload->old, 0, sizeof(upload->old));
+    return 0;
+  }
+  case _IOC_NR(UI_END_FF_UPLOAD):
+  case _IOC_NR(UI_END_FF_ERASE):
+    return 0;
+  case _IOC_NR(UI_BEGIN_FF_ERASE): {
+    auto *erase = static_cast<struct uinput_ff_erase *>(argp);
+    if (erase) erase->retval = 0;
+    return 0;
+  }''')
+# the hook-up block itself
+rep('__attribute__((visibility("hidden"))) static std::string note_sys_failure(int dirfd, const char *pathname) {',
+    block + '__attribute__((visibility("hidden"))) static std::string note_sys_failure(int dirfd, const char *pathname) {')
+# open() / openat()
+rep('  if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);\n',
+    '  if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);\n'
+    '  if (int hk = hookup_path_slot(pathname); hk >= 0) return open_hookup_hidraw(flags, hk);\n', 2)
+# stat(path)
+rep('  if (is_touch_hidraw_path(pathname)) {\n    memset(statbuf, 0, sizeof(*statbuf));',
+    '  if (hookup_path_slot(pathname) >= 0 && !process_is_steam_client()) {\n'
+    '    errno = ENOENT;\n'
+    '    return -1;\n'
+    '  }\n'
+    '  if (is_touch_hidraw_path(pathname)) {\n    memset(statbuf, 0, sizeof(*statbuf));')
+rep('  if (is_sc1_hidraw_path(pathname)) {\n    memset(statbuf, 0, sizeof(*statbuf));',
+    '  if (int hk = hookup_path_slot(pathname); hk >= 0) {\n'
+    '    memset(statbuf, 0, sizeof(*statbuf));\n'
+    '    statbuf->st_mode = S_IFCHR | 0666;\n'
+    '    statbuf->st_rdev = makedev(DECK_HIDRAW_MAJOR, HOOKUP_MINOR_BASE + hk);\n'
+    '    return 0;\n'
+    '  }\n'
+    '  if (is_sc1_hidraw_path(pathname)) {\n    memset(statbuf, 0, sizeof(*statbuf));')
+# fstat(fd)
+rep('    unsigned int minor = device.touch ? TOUCH_HIDRAW_MINOR\n',
+    '    unsigned int minor = device.hookup >= 0 ? HOOKUP_MINOR_BASE + device.hookup\n'
+    '                       : device.touch ? TOUCH_HIDRAW_MINOR\n')
+# access() / faccessat()
+rep('  if (is_sc1_hidraw_path(pathname) && process_is_steam_client()) return 0;\n',
+    '  if (is_sc1_hidraw_path(pathname) && process_is_steam_client()) return 0;\n'
+    '  if (hookup_path_slot(pathname) >= 0 && process_is_steam_client()) return 0;\n', 2)
+rep('  if (is_withdrawn_pad_path(pathname) || is_deck_hidraw_path(pathname) || is_sc1_hidraw_path(pathname) ||\n',
+    '  if (is_withdrawn_pad_path(pathname) || is_deck_hidraw_path(pathname) || is_sc1_hidraw_path(pathname) ||\n'
+    '      hookup_path_slot(pathname) >= 0 ||\n', 2)
+# ioctl
+rep('  if (deck != deck_map().end()) {\n    if (deck->second->touch) return ioctl_touch(*deck->second, op, argp);',
+    '  if (deck != deck_map().end()) {\n'
+    '    if (deck->second->hookup >= 0) {\n'
+    '      std::shared_ptr<DeckHidraw> pad = deck->second;\n'
+    '      guard.unlock();\n'
+    '      return ioctl_hookup(*pad, op, argp);\n'
+    '    }\n'
+    '    if (deck->second->touch) return ioctl_touch(*deck->second, op, argp);')
+# write() / writev()
+rep('    if (deck_map()[fd]->touch) touch_output(',
+    '    if (deck_map()[fd]->hookup >= 0) hookup_queue(*deck_map()[fd], static_cast<const uint8_t *>(buf), count, 0);\n'
+    '    else if (deck_map()[fd]->touch) touch_output(')
+rep('      if (device->touch) touch_output(',
+    '      if (device->hookup >= 0) hookup_queue(*device, static_cast<const uint8_t *>(iov[i].iov_base), iov[i].iov_len, 0);\n'
+    '      else if (device->touch) touch_output(')
+# read() of Steam's uinput fd -> queued force-feedback requests
+rep('static ssize_t read_input(int fd, void *buf, size_t count) {\n  if (!watched(fd)) return syscall(SYS_read, fd, buf, count);\n',
+    'static ssize_t read_input(int fd, void *buf, size_t count) {\n  if (!watched(fd)) return syscall(SYS_read, fd, buf, count);\n'
+    '  if (ssize_t ff = hookup_read_uinput(fd, buf, count); ff != -2) return ff;\n')
+open(cpp, 'w', encoding='utf-8').write(s)
+sys.stdout.write("OK\n")
+PY
+  then ok "native hidraw hook-up nodes + game rumble to Steam"
+  else die "hook-up native patch failed: an upstream anchor moved (see ANCHOR-MISS above)."
+  fi
+  if python3 - "$SDP" "$SVC" <<'PY'
+import sys
+sdp, svc = sys.argv[1], sys.argv[2]
+def patch(path, old, new, marker):
+    s = open(path, encoding='utf-8').read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.stderr.write("ANCHOR-MISS %s :: %r (found %d)\n" % (path, old[:70], s.count(old)))
+        sys.exit(3)
+    open(path, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+patch(sdp, '    private val padNodes = mutableMapOf<Int, String>()\n',
+      '    // sdl3bridge: where the session sysfs lives, for HookupBridge (Steam Native Hook-up) hot-plug\n'
+      '    @Volatile @JvmStatic var sysDevicesDir: File? = null\n'
+      '    @Volatile @JvmStatic var sysHidrawClassDir: File? = null\n'
+      '    @Volatile @JvmStatic var sysContext: Context? = null\n'
+      '    private val padNodes = mutableMapOf<Int, String>()\n',
+      'var sysDevicesDir: File?')
+patch(sdp, '            hidrawClassDir = hidrawClass\n',
+      '            hidrawClassDir = hidrawClass\n'
+      '            sysDevicesDir = devices\n'
+      '            sysHidrawClassDir = hidrawClass\n'
+      '            sysContext = context.applicationContext\n',
+      'sysDevicesDir = devices')
+patch(svc, '                guest.add("FAKE_DECK_SYSFS_LISTING=" + SteamDeckPad.listingDir(fakeInputDir.parentFile!!.parentFile!!).path)\n',
+      '                if (com.droiddeck.launcher.input.HookupBridge.wanted(this))\n'
+      '                    com.droiddeck.launcher.input.HookupBridge.prepare(fakeInputDir)?.let { guest.add("FAKE_HOOKUP_SHM=" + it.path) }\n'
+      '                guest.add("FAKE_DECK_SYSFS_LISTING=" + SteamDeckPad.listingDir(fakeInputDir.parentFile!!.parentFile!!).path)\n',
+      'FAKE_HOOKUP_SHM=')
+print("OK")
+PY
+  then ok "hook-up sysfs + session wiring"
+  else die "hook-up session patch failed: an upstream anchor moved (see ANCHOR-MISS above)."
+  fi
+else
+  warn "fakeinput_steam.cpp / SteamDeckPad.kt / SessionService.kt not found (skipping Steam Native Hook-up)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
