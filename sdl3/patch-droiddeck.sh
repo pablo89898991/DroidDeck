@@ -413,21 +413,20 @@ fi
 # GameThreadHints uses Android's PerformanceHintManager to push the game's busiest threads onto the
 # prime CPU cores. It was hard-gated to the Odin 3 (SoC CQ8725S). It is a PURE scheduling hint -- it
 # cannot change how a game runs, so it cannot hurt compatibility -- and it stays behind the user's
-# "game thread hints" setting. Open it to any Qualcomm SoC (same WALT scheduler / power-HAL family),
-# which includes the Snapdragon 8 Gen 2 (SM8550).
+# "game thread hints" setting (step 16 puts it in the session drawer). Open it to any Android 12+ device:
+# a power HAL without hint-session support simply returns no session and nothing happens.
 GTH="$PKG/session/GameThreadHints.kt"
 if [ -f "$GTH" ]; then
   if python3 - "$GTH" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p, encoding='utf-8').read()
-if "game thread hints: Qualcomm only" not in s:
+if "game thread hints: any device" not in s:
     old = '        if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL != "CQ8725S") return "game thread hints: Odin 3 only"'
     new = ('        if (Build.VERSION.SDK_INT < 31) return "game thread hints: needs Android 12+"\n'
-           '        // ADPF boosting is a pure scheduling hint (it cannot change how a game runs), so allow it on\n'
-           '        // any Qualcomm SoC -- the same WALT scheduler / power-HAL family it was tuned on (Odin 3).\n'
-           '        val qualcomm = Build.SOC_MANUFACTURER == "QTI" || Build.SOC_MODEL.startsWith("SM") || Build.SOC_MODEL == "CQ8725S"\n'
-           '        if (!qualcomm) return "game thread hints: Qualcomm only (tuned on Odin 3)"')
+           '        // sdl3bridge: game thread hints: any device. ADPF is a pure scheduling hint (it cannot change\n'
+           '        // how a game runs); a power HAL without hint sessions just returns none and nothing happens.\n'
+           '        // Tuned on the Odin 3; switch it off in the session drawer (Latency) if a device behaves worse.')
     if s.count(old) != 1:
         sys.stderr.write("ANCHOR-MISS GameThreadHints device gate (found %d)\n" % s.count(old))
         sys.exit(3)
@@ -435,7 +434,7 @@ if "game thread hints: Qualcomm only" not in s:
     open(p, 'w', encoding='utf-8').write(s)
 sys.stdout.write("OK\n")
 PY
-  then ok "ADPF game-thread boosting unlocked (any Qualcomm SoC)"
+  then ok "ADPF game-thread boosting unlocked (any Android 12+ device)"
   else die "GameThreadHints patch failed: an upstream anchor moved (see ANCHOR-MISS above)."
   fi
 else
@@ -1052,6 +1051,82 @@ PY
   fi
 else
   warn "fakeinput_steam.cpp / SteamDeckPad.kt / SessionService.kt not found (skipping Steam Native Hook-up)"
+fi
+
+# ---------- 16. "Game thread boost" switch in the session drawer (Latency group) ----------
+# DroidDeck already had a gameThreadHints preference (default on) but no switch for it. Add one next to
+# the low-latency switches; it takes effect immediately (starts/stops the boosting in the running session).
+SP="$PKG/session/SessionPrefs.kt"
+SO="$PKG/ui/SessionOverlay.kt"
+SA="$PKG/SessionActivity.kt"
+STR="$DD/app/src/main/res/values/strings.xml"
+if [ -f "$SP" ] && [ -f "$SO" ] && [ -f "$SA" ] && [ -f "$STR" ]; then
+  if python3 - "$SP" "$SO" "$SA" "$STR" <<'PY'
+import sys
+sp, so, sa, st = sys.argv[1:5]
+def patch(path, edits):
+    s = open(path, encoding='utf-8').read()
+    for old, new, marker in edits:
+        if marker in s:
+            continue
+        if s.count(old) != 1:
+            sys.stderr.write("ANCHOR-MISS %s :: %r (found %d)\n" % (path, old[:70], s.count(old)))
+            sys.exit(3)
+        s = s.replace(old, new, 1)
+    open(path, 'w', encoding='utf-8').write(s)
+patch(sp, [(
+    '    fun gameThreadHints(context: Context): Boolean = prefs(context).getBoolean("gameThreadHints", true)\n',
+    '    fun gameThreadHints(context: Context): Boolean = prefs(context).getBoolean("gameThreadHints", true)\n\n'
+    '    fun setGameThreadHints(context: Context, on: Boolean) {\n'
+    '        prefs(context).edit().putBoolean("gameThreadHints", on).apply()\n'
+    '    }\n',
+    'fun setGameThreadHints(')])
+patch(so, [
+    ('    val onLowLatencyTouch: (Boolean) -> Unit = {},\n',
+     '    val onLowLatencyTouch: (Boolean) -> Unit = {},\n'
+     '    val gameThreadHints: Boolean = true,\n'
+     '    val onGameThreadHints: (Boolean) -> Unit = {},\n',
+     'val onGameThreadHints:'),
+    ('                                    chipModifier = focus.track(page, "low-latency-touch"), onChange = a.onLowLatencyTouch)\n',
+     '                                    chipModifier = focus.track(page, "low-latency-touch"), onChange = a.onLowLatencyTouch)\n'
+     '                                ToggleRow(host, "game-thread-hints", stringResource(R.string.drawer_game_thread_hints),\n'
+     '                                    stringResource(R.string.drawer_game_thread_hints_hint), a.gameThreadHints,\n'
+     '                                    chipModifier = focus.track(page, "game-thread-hints"), onChange = a.onGameThreadHints)\n',
+     '"game-thread-hints"'),
+])
+patch(sa, [
+    ('    private var lowLatencyTouch by mutableStateOf(false)\n',
+     '    private var lowLatencyTouch by mutableStateOf(false)\n'
+     '    private var gameThreadHints by mutableStateOf(true)\n',
+     'private var gameThreadHints by'),
+    ('        lowLatencyTouch = SessionPrefs.lowLatencyTouch(this)\n',
+     '        lowLatencyTouch = SessionPrefs.lowLatencyTouch(this)\n'
+     '        gameThreadHints = SessionPrefs.gameThreadHints(this)\n',
+     'gameThreadHints = SessionPrefs.gameThreadHints(this)'),
+    ('                    lowLatencyTouch = lowLatencyTouch,\n',
+     '                    lowLatencyTouch = lowLatencyTouch,\n'
+     '                    gameThreadHints = gameThreadHints,\n'
+     '                    onGameThreadHints = { on ->\n'
+     '                        SessionPrefs.setGameThreadHints(this@SessionActivity, on)\n'
+     '                        gameThreadHints = on\n'
+     '                        if (on) android.util.Log.i("GameThreadHints", com.droiddeck.launcher.session.GameThreadHints.start(this@SessionActivity))\n'
+     '                        else com.droiddeck.launcher.session.GameThreadHints.stop()\n'
+     '                    },\n',
+     'onGameThreadHints = { on ->'),
+])
+patch(st, [(
+    '</resources>',
+    '    <string name="drawer_game_thread_hints">Game thread boost</string>\n'
+    '    <string name="drawer_game_thread_hints_hint">Moves the busiest game threads to the fastest CPU cores (Android performance hints). Turn off if a game paces worse.</string>\n'
+    '</resources>',
+    'drawer_game_thread_hints')])
+print("OK")
+PY
+  then ok "session drawer: Game thread boost switch"
+  else die "Game thread boost switch: an upstream anchor moved (see ANCHOR-MISS above)."
+  fi
+else
+  warn "SessionPrefs/SessionOverlay/SessionActivity/strings.xml not found (skipping Game thread boost switch)"
 fi
 
 echo
