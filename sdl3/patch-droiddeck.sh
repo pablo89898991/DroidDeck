@@ -1164,8 +1164,10 @@ fi
 
 # ---------- 17. "Game thread boost" switch in DroidDeck's Settings -> Performance page too ----------
 PD="$PKG/ui/PerformanceDialog.kt"
-MA="$PKG/MainActivity.kt"
-if [ -f "$PD" ] && [ -f "$MA" ]; then
+# The activity that holds the Performance page state (MainActivity.kt, renamed FrontEndActivity.kt upstream in
+# 0.6.0): whichever top-level activity has the gpuClockPin state.
+MA="$(grep -l 'private var gpuClockPin by mutableStateOf' "$PKG"/*.kt 2>/dev/null | head -1)"
+if [ -f "$PD" ] && [ -n "$MA" ] && [ -f "$MA" ]; then
   if python3 - "$PD" "$MA" <<'PY'
 import sys
 pd, ma = sys.argv[1], sys.argv[2]
@@ -1212,7 +1214,7 @@ PY
   else die "Performance page switch: an upstream anchor moved (see ANCHOR-MISS above)."
   fi
 else
-  warn "PerformanceDialog.kt / MainActivity.kt not found (skipping Performance page switch)"
+  warn "PerformanceDialog.kt / the activity with the Performance page state not found (skipping Performance page switch)"
 fi
 
 # ---------- 18. Steam Native Hook-up: no extra Steam Deck pad next to the real controller ----------
