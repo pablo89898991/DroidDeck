@@ -1349,5 +1349,45 @@ PY
   fi
 fi
 
+# ---------- 21. Steam Input updates the game's virtual controller faster (controller_rate) ----------
+# Steam Input's virtual controller (what the game reads) is updated every controller_rate microseconds:
+# Steam's default is 2000 (500 Hz). Typed in Steam's console it lasts until Steam restarts, so DroidDeck now
+# starts the client with "+controller_rate 500" (2000 Hz) every time. Another value (0 = no limit) can be put
+# in ~/.config/droiddeck/controller-rate inside the Linux system.
+SESS="$DD/tools/linuxfs/overlay/usr/local/bin/droiddeck-session"
+if [ -f "$SESS" ]; then
+  if python3 - "$SESS" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+MARK = "sdl3bridge: controller_rate"
+if MARK in s:
+    print("already"); sys.exit(0)
+edits = [
+    ('    [ -n "${BL_STEAM_LANGUAGE:-}" ] && _bl_lang=(-language "$BL_STEAM_LANGUAGE")\n',
+     '    [ -n "${BL_STEAM_LANGUAGE:-}" ] && _bl_lang=(-language "$BL_STEAM_LANGUAGE")\n'
+     '    # ' + MARK + ': how often Steam Input updates the game\'s virtual controller, in microseconds\n'
+     '    # (Steam\'s default 2000 = 500 Hz). Override in ~/.config/droiddeck/controller-rate (0 = no limit).\n'
+     '    _bl_rate=$(cat "$HOME/.config/droiddeck/controller-rate" 2>/dev/null)\n'
+     '    case $_bl_rate in \'\'|*[!0-9]*) _bl_rate=500 ;; esac\n'
+     '    _bl_input=(+controller_rate "$_bl_rate")\n'),
+    ('${_bl_lang[*]} -clientbeta $steam_channel', '${_bl_lang[*]} ${_bl_input[*]} -clientbeta $steam_channel'),
+    ('"${_bl_lang[@]}" -clientbeta "$steam_channel"', '"${_bl_lang[@]}" "${_bl_input[@]}" -clientbeta "$steam_channel"'),
+]
+for old, new in edits:
+    if s.count(old) != 1:
+        sys.stderr.write("ANCHOR-MISS controller_rate :: %r (found %d)\n" % (old[:70], s.count(old)))
+        sys.exit(3)
+    s = s.replace(old, new, 1)
+open(p, "w", encoding="utf-8").write(s)
+print("OK")
+PY
+  then ok "Steam started with +controller_rate 500 (virtual controller updated at 2000 Hz)"
+  else warn "could not add +controller_rate to the Steam launch (upstream session script changed)"
+  fi
+else
+  warn "droiddeck-session not found (skipping +controller_rate)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
