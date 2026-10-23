@@ -1346,7 +1346,7 @@ PY
 fi
 
 # ---------- 20. CI downloads retry instead of hanging ----------
-# The APK build downloads gamescope, mangoapp, PipeWire and msitools packages with curl, which has no time
+# The build downloads gamescope, mangoapp, PipeWire, msitools and the Debian image with curl, which has no time
 # limit: one stalled connection (Valve's package servers do that now and then) hangs the build until GitHub
 # kills it after 45 minutes. A ~/.curlrc written first makes a stalled download time out (no connection in 30 s,
 # or under 2 KB/s for a minute), and the build's own --retry 3 then tries again.
@@ -1358,9 +1358,12 @@ s = open(p, encoding="utf-8").read()
 MARK = "SDL3Deck: downloads retry instead of hanging"
 if MARK in s:
     print("already"); sys.exit(0)
-anchor = "      - name: Build libfakeinput.so and libblsession.so"
-if s.count(anchor) != 1:
-    sys.stderr.write("ANCHOR-MISS curlrc :: %r (found %d)\n" % (anchor, s.count(anchor))); sys.exit(3)
+# the first step of the job that downloads runtime components (upstream reorganised it; older layout first)
+anchors = ["      - name: Build libfakeinput.so and libblsession.so",
+           "      - name: Restore verified preload snapshots"]
+anchor = next((a for a in anchors if s.count(a) == 1), None)
+if not anchor:
+    sys.stderr.write("ANCHOR-MISS curlrc :: none of %r\n" % anchors); sys.exit(3)
 step = ("      - name: \"" + MARK + "\"\n"
         "        run: printf 'connect-timeout = 30\\nspeed-limit = 2048\\nspeed-time = 60\\n' > \"$HOME/.curlrc\"\n\n")
 s = s.replace(anchor, step + anchor, 1)
@@ -1619,6 +1622,41 @@ PY
   esac
 else
   warn "hook-up block not in fakeinput_steam.cpp (skipping the pad mailbox)"
+fi
+
+# ---------- 26. CI: the Debian build image comes from upstream's release when the fork has none ----------
+# Upstream's build downloads its pinned Debian image from a release of the repo being built. A fork doesn't have
+# that release, so the build fell back to pulling from Amazon's public registry, which rate-limits GitHub's
+# runners ("toomanyrequests: Data limit exceeded") and failed the build. The same file is published on
+# upstream's release: fetch it from there (checked against upstream's pinned SHA-256) before the registry.
+DEBIMG="$DD/tools/components/recipes/debian-image.sh"
+if [ -f "$DEBIMG" ]; then
+  res=$(python3 - "$DEBIMG" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path, encoding='utf-8').read()
+if 'sdl3deck: upstream release' in s:
+    print("SKIP")
+    sys.exit(0)
+old = ('if gh release download "$DEBIAN_IMAGE_TAG" -R "$GITHUB_REPOSITORY" -p "$DEBIAN_IMAGE_ASSET" -O /tmp/debian-image.tar.zst \\\n'
+       '   && {')
+new = ('# sdl3deck: upstream release when this fork has none (same file, same pinned SHA-256)\n'
+       'if { gh release download "$DEBIAN_IMAGE_TAG" -R "$GITHUB_REPOSITORY" -p "$DEBIAN_IMAGE_ASSET" -O /tmp/debian-image.tar.zst \\\n'
+       '     || { rm -f /tmp/debian-image.tar.zst; curl -fsSL --retry 3 -o /tmp/debian-image.tar.zst \\\n'
+       '          "https://github.com/Droid-Deck/droiddeck/releases/download/$DEBIAN_IMAGE_TAG/$DEBIAN_IMAGE_ASSET"; }; } \\\n'
+       '   && {')
+if s.count(old) != 1 or 'DEBIAN_IMAGE_SHA256' not in s:
+    sys.stderr.write("ANCHOR-MISS debian-image.sh :: %r\n" % old[:70])
+    sys.exit(3)
+open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+print("OK")
+PY
+)
+  case "$res" in
+    OK) ok "CI: Debian build image from upstream's release (no registry rate limit)" ;;
+    SKIP) skip "CI Debian image from upstream's release" ;;
+    *) warn "CI Debian image fallback left out (debian-image.sh changed upstream, see ANCHOR-MISS above)" ;;
+  esac
 fi
 
 echo
