@@ -549,11 +549,12 @@ class LaunchTest(FexTestCase):
     def test_the_guest_environment(self):
         arm = self.write(self.tmp / "arm.so", elf(183))
         x86 = self.write(self.tmp / "x86.so", elf(62))
-        env = {"LD_PRELOAD": "%s:%s %s" % (arm, x86, self.tmp / "gone.so"),
+        env = {"LD_PRELOAD": "%s:%s %s libMelonLoader.Bootstrap.so" % (arm, x86, self.tmp / "gone.so"),
                "LD_LIBRARY_PATH": "/steam/steamrtarm64:/usr/lib/aarch64-linux-gnu:/game/lib:/steam/linuxarm64",
                "FEX_ROOTFS": "/usr/share/guestos/fex-mesa", "FEX_TSOENABLED": "1"}
         guest = FEX["guest_environment"]({"portable": True}, env)
-        self.assertEqual((guest["LD_PRELOAD"], guest["LD_LIBRARY_PATH"], guest["FEX_PORTABLE"]), (str(x86), "/game/lib", "1"))
+        self.assertEqual((guest["LD_PRELOAD"], guest["LD_LIBRARY_PATH"], guest["FEX_PORTABLE"]),
+                         ("%s:libMelonLoader.Bootstrap.so" % x86, "/game/lib", "1"))
         self.assertNotIn("FEX_ROOTFS", guest)
         self.assertEqual(guest["FEX_TSOENABLED"], "1")
         self.assertTrue(guest["FEX_APP_CONFIG_LOCATION"].endswith("/config/"))

@@ -589,7 +589,8 @@ def guest_environment(fex, env):
         result["FEX_THUNKHOSTLIBS"] = fex["host_thunks"]
         result["FEX_THUNKGUESTLIBS"] = fex["guest_thunks"]
         result["FEX_THUNKCONFIG"] = os.path.join(CONFIG_DIR, "ThunksConfig.json")
-    preload = [part for part in split_paths(result.get("LD_PRELOAD")) if os.path.exists(part) and not is_arm(part)]
+    preload = [part for part in split_paths(result.get("LD_PRELOAD"))
+               if "/" not in part or (os.path.exists(part) and not is_arm(part))]
     library_path = [part for part in (result.get("LD_LIBRARY_PATH") or "").split(":")
                     if part and "arm64" not in part and "aarch64" not in part]
     for name, parts in (("LD_PRELOAD", preload), ("LD_LIBRARY_PATH", library_path)):

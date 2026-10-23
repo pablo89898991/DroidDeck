@@ -2,7 +2,10 @@
 set -euo pipefail
 . tools/linuxfs/debian-image.env
 image=public.ecr.aws/docker/library/debian:bullseye
-if gh release download "$DEBIAN_IMAGE_TAG" -R "$GITHUB_REPOSITORY" -p "$DEBIAN_IMAGE_ASSET" -O /tmp/debian-image.tar.zst \
+# sdl3deck: upstream release when this fork has none (same file, same pinned SHA-256)
+if { gh release download "$DEBIAN_IMAGE_TAG" -R "$GITHUB_REPOSITORY" -p "$DEBIAN_IMAGE_ASSET" -O /tmp/debian-image.tar.zst \
+     || { rm -f /tmp/debian-image.tar.zst; curl -fsSL --retry 3 -o /tmp/debian-image.tar.zst \
+          "https://github.com/Droid-Deck/droiddeck/releases/download/$DEBIAN_IMAGE_TAG/$DEBIAN_IMAGE_ASSET"; }; } \
    && { [ -z "$DEBIAN_IMAGE_SHA256" ] || echo "$DEBIAN_IMAGE_SHA256  /tmp/debian-image.tar.zst" | sha256sum -c -; }; then
   zstd -dc /tmp/debian-image.tar.zst | docker load
   rm -f /tmp/debian-image.tar.zst
