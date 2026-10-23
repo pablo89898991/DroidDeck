@@ -177,10 +177,36 @@ struct HookupLatency {
 };
 
 static std::atomic<uint64_t> g_hookup_press_us{0};   // Steam process: a press Steam has read, not yet on its pad
+
+/**
+ * Steam's controller work runs at a higher priority, like Android's own input threads (nice -8): the threads that
+ * read controllers (hooked-up ones and DroidDeck's own pads -- every controller), the one that writes Steam's
+ * virtual pad, and ours that hand reports over. On a phone the game and the emulation keep the CPU busy, and
+ * Steam's controller loop otherwise waits its turn behind them -- that is when it reads late. Once per thread; if
+ * Android doesn't allow it, nothing changes (logged once).
+ */
+__attribute__((visibility("hidden"))) static void hookup_boost_this_thread(const char *what) {
+  static thread_local bool done;
+  if (done) return;
+  done = true;
+  if (!process_is_steam_client()) return;
+  pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  errno = 0;
+  int was = getpriority(PRIO_PROCESS, static_cast<id_t>(tid));
+  if (errno == 0 && was <= -8) return;
+  if (setpriority(PRIO_PROCESS, static_cast<id_t>(tid), -8) == 0) {
+    Logger::log("thread %d (%s) now runs at higher priority (nice %d -> -8)\n", tid, what, was);
+  } else {
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true))
+      Logger::log("could not raise the priority of thread %d (%s): %s\n", tid, what, strerror(errno));
+  }
+}
 static std::atomic<int> g_hookup_samples{0};
 
 /** Steam process, as Steam writes its virtual pad: the end of step 2. */
 __attribute__((visibility("hidden"))) static void hookup_meter_virtual_pad(const std::vector<struct input_event> &events) {
+  hookup_boost_this_thread("writes Steam's virtual controller");
   uint64_t press = g_hookup_press_us.load(std::memory_order_acquire);
   if (!press) return;
   static HookupLatency stat;
@@ -443,6 +469,7 @@ __attribute__((visibility("hidden"))) static void hookup_meter_handed(HookupQueu
 
 /** Steam's read() of a hooked-up node: the next report from the mailbox (see HookupQueue). */
 __attribute__((visibility("hidden"))) static ssize_t hookup_read_steam(int fd, HookupQueue &q, void *buf, size_t count) {
+  hookup_boost_this_thread("reads a hooked-up controller");
   for (;;) {
     {
       std::lock_guard<std::mutex> guard(q.lock);
@@ -487,6 +514,7 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
   HookupSlot *s = hookup_slot(self->hookup);
   std::shared_ptr<HookupQueue> qp = self->hookup_in;
   HookupQueue &q = *qp;
+  hookup_boost_this_thread("hands controller reports to Steam");
   uint64_t next = s ? __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE) : 0;
   uint64_t meter_us = monotonic_us();
   auto kind_of = [&](const uint8_t *d, uint32_t length) {
@@ -831,7 +859,11 @@ __attribute__((visibility("hidden"))) static ssize_t hookup_read_uinput(int fd, 
   if (made == uinput_map().end()) {
     // Steam reading a hooked-up controller: answered from its mailbox (HookupQueue), unlocked
     auto deck = deck_map().find(fd);
-    if (deck == deck_map().end() || deck->second->hookup < 0 || !deck->second->hookup_in) return -2;
+    if (deck == deck_map().end()) return -2;
+    if (deck->second->hookup < 0 || !deck->second->hookup_in) {  // one of DroidDeck's own pads
+      hookup_boost_this_thread("reads DroidDeck's controller");
+      return -2;
+    }
     std::shared_ptr<HookupQueue> q = deck->second->hookup_in;
     guard.unlock();
     return hookup_read_steam(fd, *q, buf, count);

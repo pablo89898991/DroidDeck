@@ -948,7 +948,7 @@ def rep(old, new, want=1):
         sys.exit(3)
     s = s.replace(old, new)
 
-rep('#include <vector>\n', '#include <vector>\n#include <deque>\n')
+rep('#include <vector>\n', '#include <vector>\n#include <deque>\n#include <sys/resource.h>\n')
 # DeckHidraw: which hook-up slot a hidraw fd serves
 rep('  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n};',
     '  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n'
