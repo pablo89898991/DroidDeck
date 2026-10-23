@@ -179,18 +179,6 @@ struct HookupLatency {
 static std::atomic<uint64_t> g_hookup_press_us{0};   // Steam process: a press Steam has read, not yet on its pad
 static std::atomic<int> g_hookup_samples{0};
 
-/** For the latency meter only: gamepad-style buttons of a Sony controller's USB input report (DualSense / Edge,
- *  DualShock 4); 0 = layout not known here. Left out: L2 / R2 (analog), PS (Steam's menu), touchpad click, mute. */
-__attribute__((visibility("hidden"))) static uint32_t hookup_buttons(const HookupSlot &s, const uint8_t *d, uint32_t n) {
-  if (s.vendor != 0x054c || n < 11 || d[0] != 0x01) return 0;
-  if (s.product == 0x0ce6 || s.product == 0x0df2)  // DualSense, DualSense Edge
-    return 0x80000000u | ((d[8] & 0x0f) != 8 ? 1u : 0u) | (d[8] & 0xf0u) | (uint32_t)(d[9] & 0xf3) << 8 |
-           (uint32_t)(d[10] & 0xf0) << 16;
-  if (s.product == 0x05c4 || s.product == 0x09cc)  // DualShock 4
-    return 0x80000000u | ((d[5] & 0x0f) != 8 ? 1u : 0u) | (d[5] & 0xf0u) | (uint32_t)(d[6] & 0xf3) << 8;
-  return 0;
-}
-
 /** Steam process, as Steam writes its virtual pad: the end of step 2. */
 __attribute__((visibility("hidden"))) static void hookup_meter_virtual_pad(const std::vector<struct input_event> &events) {
   uint64_t press = g_hookup_press_us.load(std::memory_order_acquire);
@@ -386,8 +374,18 @@ struct HookupReportKind {
     }
     return false;
   }
-  /** A non-moving bit that went from 0 to 1 (most likely a press; for the latency meter). */
-  bool state_rise(const uint8_t *d, const uint8_t *ref) const {
+  /**
+   * For the latency meter, any controller: a button press since `ref` -- a declared button (HID descriptor) that
+   * turned on, or, for controllers that declare none, a learned non-moving bit that turned on.
+   */
+  bool press(const uint8_t *d, const uint8_t *ref) const {
+    bool declared = false;
+    for (uint32_t i = 0; i < length; i++) {
+      if (!buttons[i]) continue;
+      declared = true;
+      if (d[i] & ~ref[i] & buttons[i]) return true;
+    }
+    if (declared || !learned) return false;
     for (uint32_t i = 0; i < length; i++)
       if (d[i] & ~ref[i] & ~moving[i]) return true;
     return false;
@@ -428,22 +426,14 @@ struct HookupQueue {
 };
 
 /** Steam process, as Steam reads a report from the mailbox: step 1 of the latency meter, and the start of step 2. */
-__attribute__((visibility("hidden"))) static void hookup_meter_handed(const HookupSlot *s, HookupQueue &q,
-                                                                      const HookupQueue::Entry &e, uint64_t now) {
+__attribute__((visibility("hidden"))) static void hookup_meter_handed(HookupQueue &q, const HookupQueue::Entry &e,
+                                                                      uint64_t now) {
   uint64_t wait = now - e.arrived_us;
   q.handed++;
   q.wait_sum_us += wait;
   if (wait > q.wait_max_us) q.wait_max_us = wait;
   HookupReportKind *k = e.kind >= 0 ? &q.kinds[e.kind] : nullptr;
-  bool press;
-  uint32_t now_buttons = s ? hookup_buttons(*s, e.data, e.length) : 0;
-  if (now_buttons) {
-    uint32_t was = k && k->has_given ? hookup_buttons(*s, k->given, e.length) : 0;
-    press = now_buttons & ~was & 0x7fffffffu;
-  } else {
-    press = k && k->learned && k->has_given && k->state_rise(e.data, k->given);
-  }
-  if (!press) return;
+  if (!k || !k->has_given || !k->press(e.data, k->given)) return;
   static HookupLatency stat;
   stat.add("button press waited for Steam to read it", wait, now);
   g_hookup_press_us.store(now, std::memory_order_release);
@@ -452,9 +442,7 @@ __attribute__((visibility("hidden"))) static void hookup_meter_handed(const Hook
 }
 
 /** Steam's read() of a hooked-up node: the next report from the mailbox (see HookupQueue). */
-__attribute__((visibility("hidden"))) static ssize_t hookup_read_steam(int fd, int slot, HookupQueue &q, void *buf,
-                                                                      size_t count) {
-  HookupSlot *s = hookup_slot(slot);
+__attribute__((visibility("hidden"))) static ssize_t hookup_read_steam(int fd, HookupQueue &q, void *buf, size_t count) {
   for (;;) {
     {
       std::lock_guard<std::mutex> guard(q.lock);
@@ -469,7 +457,7 @@ __attribute__((visibility("hidden"))) static ssize_t hookup_read_steam(int fd, i
         }
         size_t copied = std::min<size_t>(count, e.length);
         memcpy(buf, e.data, copied);
-        hookup_meter_handed(s, q, e, monotonic_us());
+        hookup_meter_handed(q, e, monotonic_us());
         if (e.kind >= 0) {
           memcpy(q.kinds[e.kind].given, e.data, e.length);
           q.kinds[e.kind].has_given = true;
@@ -845,9 +833,8 @@ __attribute__((visibility("hidden"))) static ssize_t hookup_read_uinput(int fd, 
     auto deck = deck_map().find(fd);
     if (deck == deck_map().end() || deck->second->hookup < 0 || !deck->second->hookup_in) return -2;
     std::shared_ptr<HookupQueue> q = deck->second->hookup_in;
-    int slot = deck->second->hookup;
     guard.unlock();
-    return hookup_read_steam(fd, slot, *q, buf, count);
+    return hookup_read_steam(fd, *q, buf, count);
   }
   std::shared_ptr<UinputWriter> w = made->second;
   if (count < sizeof(struct input_event)) {
