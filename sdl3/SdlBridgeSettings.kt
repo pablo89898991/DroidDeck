@@ -175,7 +175,9 @@ internal fun SdlBridgeSettingsTab(host: MenuHost, track: (String) -> Modifier = 
         } else {
             SettingsRow("Status", s.getString("status") ?: "") {}
             val engineError = s.getString("engineError") ?: ""
+            val engineMode = s.getString("engineMode") ?: ""
             if (engineError.isNotEmpty()) SettingsRow("SDL3 is not running", engineError) {}
+            else if (engineMode.isNotEmpty() && engineMode != "background service") SettingsRow("SDL3 runs in", engineMode) {}
             if (!s.getBoolean("notifications", true)) SettingsRow("Status bar icon is hidden",
                 "SDL3Bridge may not show notifications: open it once and tap Allow (or allow it in Android's app settings).") {}
             val padNames = s.getStringArray("padNames") ?: emptyArray()
