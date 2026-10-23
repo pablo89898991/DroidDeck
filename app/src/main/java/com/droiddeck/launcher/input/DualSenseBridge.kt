@@ -58,6 +58,7 @@ object DualSenseBridge {
     private const val MSG_BRIDGE_LOG = 30
     // Background watchdog (like Steam on a PC: controllers are picked up whenever they appear)
     private const val MSG_HOOKUP_SYNC = 9      // -> bridge: "send me everything you hand over right now"
+    private const val MSG_HOOKUP_SHM = 25      // -> bridge: "fd" = the shared hook-up file (fast path)
     private const val MSG_HOOKUP_STATE = 24    // <- bridge: "slots": the hook-up slots that are live
     private const val WATCHDOG_MS = 1500L
     private const val SLOTS = 4
@@ -132,9 +133,32 @@ object DualSenseBridge {
     private val lastSepPads = ShortArray(4)
     private val lastSepPressure = ShortArray(2)
 
-    private val worker = android.os.HandlerThread("ds-bridge", android.os.Process.THREAD_PRIORITY_DISPLAY).apply { start() }
+    private val worker = android.os.HandlerThread("ds-bridge", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
     private val workerHandler = Handler(worker.looper)
     private val inbox = Messenger(object : Handler(worker.looper) {
+        /*
+         * Called on the Binder thread that received the bridge's message, before it is queued. Input must never
+         * wait in a queue: with a game running the worker thread can get less CPU than 500-1000 messages a second
+         * need, and an ever-growing queue of old input is lag that builds up over time. So:
+         *  - controller reports for Steam (hook-up) and Steam Controller states go straight into shared memory;
+         *  - frames are "latest wins" per controller (see offerFrame), so only fresh state waits for the worker.
+         */
+        override fun sendMessageAtTime(msg: Message, uptimeMillis: Long): Boolean {
+            if (msg.callback == null) when (msg.what) {
+                MSG_FRAME -> { offerFrame(msg.data); return true }
+                MSG_HOOKUP_INPUT -> {
+                    msg.data.getByteArray("data")?.let { HookupBridge.input(msg.data.getInt("slot"), it) }
+                    return true
+                }
+                MSG_TRITON_STATE -> {
+                    val d = msg.data.getByteArray("data")
+                    if (d != null && tritonOn) FakeInputWriter.writeTritonState(TRITON_SLOT, msg.data.getInt("id"), d)
+                    return true
+                }
+            }
+            return super.sendMessageAtTime(msg, uptimeMillis)
+        }
+
         override fun handleMessage(m: Message) {
             when (m.what) {
                 MSG_FRAME -> onFrame(m.data)
@@ -148,6 +172,9 @@ object DualSenseBridge {
                 MSG_HOOKUP_INPUT -> m.data.getByteArray("data")?.let { HookupBridge.input(m.data.getInt("slot"), it) }
                 MSG_HOOKUP_STATE -> {
                     val live = m.data.getIntArray("slots") ?: IntArray(0)
+                    // the bridge maps a different (or no) shared file: hand it the current one (at most every 10 s)
+                    if (m.data.getLong("fast_ino", 0L) != HookupBridge.shmInode() &&
+                        android.os.SystemClock.uptimeMillis() - shmSentMs > 10_000) sendShm()
                     for (s in 0 until HookupBridge.SLOTS) if (HookupBridge.isPresent(s) && s !in live) {
                         HookupBridge.note("hookup: the bridge no longer hands over slot $s; removing it")
                         HookupBridge.remove(s)
@@ -170,6 +197,7 @@ object DualSenseBridge {
         override fun onServiceConnected(n: ComponentName, b: IBinder) {
             server = Messenger(b)
             send(Message.obtain(null, MSG_REGISTER).apply { replyTo = inbox })
+            sendShm()
         }
         override fun onServiceDisconnected(n: ComponentName) {
             server = null; release()
@@ -192,6 +220,7 @@ object DualSenseBridge {
             // A new session screen while the old one is still being torn down (Android recreates it when you
             // come back from another app): keep the connection, and ask the bridge to resend its state.
             send(Message.obtain(null, MSG_REGISTER).apply { replyTo = inbox })
+            sendShm()
             HookupBridge.note("bridge: new session screen, connection kept, state re-requested")
             return true
         }
@@ -273,6 +302,26 @@ object DualSenseBridge {
                 })
             }
             workerHandler.postDelayed(this, TRITON_POLL_MS)
+        }
+    }
+
+    // ---------------- Steam Native Hook-up fast path ----------------
+    // The bridge gets the shared hook-up file itself (as a descriptor: Android lets an app use a descriptor it is
+    // handed, only opening another app's file by path is forbidden). It then writes each report straight into
+    // the file and wakes Steam's reader -- no message per report, no polling -- and DroidDeck only keeps the
+    // controller list and its sysfs description. An older bridge simply ignores the message.
+    @Volatile private var shmSentMs = 0L
+
+    private fun sendShm() {
+        val file = HookupBridge.shmFile ?: return
+        if (server == null) return
+        shmSentMs = android.os.SystemClock.uptimeMillis()
+        try {
+            android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_WRITE).use { pfd ->
+                send(Message.obtain(null, MSG_HOOKUP_SHM).apply { data = Bundle().apply { putParcelable("fd", pfd) } })
+            }
+        } catch (e: Exception) {
+            HookupBridge.note("hookup: could not hand the shared file to the bridge: $e")
         }
     }
 
@@ -478,6 +527,60 @@ object DualSenseBridge {
     /** True while player 1's controller is streaming; PadMotion uses this to stop writing the phone's gyro. */
     @JvmStatic
     fun isActive(): Boolean = frameMsS[0] != 0L && SystemClock.elapsedRealtime() - frameMsS[0] < 1000L
+
+    // ---------------- frames: latest wins ----------------
+    // Each bridge frame is a complete controller state, so when several wait for the worker only the newest matters
+    // -- except frames where a button, trackpad touch or click changed, which are all kept so no tap is lost. A
+    // frame that only moves sticks / gyro and is already older than FRAME_STALE_NS (a backlog inside Binder) is
+    // dropped: its state is out of date and a newer frame follows.
+    private const val FRAME_STALE_NS = 50_000_000L
+    private const val FRAME_PENDING_MAX = 16
+    private val frames = FrameMailbox<Bundle>(SLOTS, FRAME_STALE_NS, FRAME_PENDING_MAX,
+        sigOf = ::frameSig, sentNsOf = { it.getLong("t", 0L) }, nowNs = SystemClock::elapsedRealtimeNanos)
+    private val drainFrames = Array(SLOTS) { slot -> Runnable { drainFrames(slot) } }
+
+    /** The digital part of a frame: buttons, trackpad click side, which trackpads are touched. */
+    private fun frameSig(b: Bundle): Long {
+        val padL = b.getFloatArray("padL")
+        val padR = b.getFloatArray("padR")
+        val touch = b.getIntArray("touch")
+        return (b.getInt("mask").toLong() and 0xffffffffL) or
+            ((b.getInt("padClick", -1) + 1).toLong() shl 32) or
+            ((if (padL != null && padL.isNotEmpty() && padL[0] > 0f) 1L else 0L) shl 34) or
+            ((if (padR != null && padR.isNotEmpty() && padR[0] > 0f) 1L else 0L) shl 35) or
+            (((touch?.size ?: 0) / 3).toLong() shl 36)
+    }
+
+    private fun offerFrame(b: Bundle) {
+        val slot = b.getInt("slot", 0).coerceIn(0, SLOTS - 1)
+        if (frames.offer(slot, b)) workerHandler.post(drainFrames[slot])
+    }
+
+    private fun drainFrames(slot: Int) {
+        val now = SystemClock.elapsedRealtimeNanos()
+        for (f in frames.take(slot)) {
+            val sent = f.getLong("t", 0L)
+            if (sent != 0L) lagMaxNs = maxOf(lagMaxNs, now - sent)
+            lagHandled++
+            onFrame(f)
+        }
+        lagReport(now)
+    }
+
+    // Lag meter, written to pad.log every 10 s when input was late: how old frames were when handled (bridge ->
+    // Binder -> this thread) and how many stale ones were dropped. Lag that keeps growing shows up here.
+    private var lagHandled = 0
+    private var lagMaxNs = 0L
+    private var lagSinceNs = 0L
+    private fun lagReport(now: Long) {
+        if (lagSinceNs == 0L) lagSinceNs = now
+        if (now - lagSinceNs < 10_000_000_000L) return
+        val dropped = frames.takeDropped()
+        if (lagMaxNs > 20_000_000L || dropped > 0)
+            HookupBridge.note("bridge: input lag, last 10 s: %d frames handled, oldest %.1f ms; %d stale frames dropped"
+                .format(lagHandled, lagMaxNs / 1e6, dropped))
+        lagSinceNs = now; lagHandled = 0; lagMaxNs = 0L
+    }
 
     /**
      * True when [dev] is the same physical controller the SDL3 bridge is currently streaming (any player slot).
@@ -850,4 +953,54 @@ object DualSenseBridge {
             DeckControls.setClick(false, false); DeckControls.setClick(true, false)
         }
     }
+}
+
+// ==== FrameMailbox (self-contained: tested on its own) ====
+/**
+ * "Latest wins" queue of controller frames per slot, filled on Binder threads and emptied by the worker thread.
+ * A frame whose digital part (buttons, trackpad touches / click: [sigOf]) equals the newest waiting one replaces
+ * it -- only the newest analog state matters -- while every change of the digital part is kept, so no tap is lost.
+ * A frame that arrives already older than [staleNs] without a digital change is dropped (a backlog upstream).
+ */
+internal class FrameMailbox<T>(
+    slots: Int,
+    private val staleNs: Long,
+    private val maxPending: Int,
+    private val sigOf: (T) -> Long,
+    private val sentNsOf: (T) -> Long,
+    private val nowNs: () -> Long,
+) {
+    private val pending = Array(slots) { ArrayDeque<T>() }
+    private val queued = BooleanArray(slots)
+    private val offeredSig = LongArray(slots) { Long.MIN_VALUE }
+    private var dropped = 0
+
+    /** @return true when the caller must schedule [take] for this slot (it wasn't scheduled yet). */
+    @Synchronized
+    fun offer(slot: Int, frame: T): Boolean {
+        val sig = sigOf(frame)
+        val sent = sentNsOf(frame)
+        if (sent != 0L && nowNs() - sent > staleNs && sig == offeredSig[slot]) { dropped++; return false }
+        offeredSig[slot] = sig
+        val q = pending[slot]
+        val last = q.lastOrNull()
+        if (last != null && sigOf(last) == sig) q.removeAt(q.size - 1)
+        q.addLast(frame)
+        while (q.size > maxPending) q.removeAt(0)
+        if (queued[slot]) return false
+        queued[slot] = true
+        return true
+    }
+
+    /** Everything waiting for this slot, oldest first (usually one frame). */
+    @Synchronized
+    fun take(slot: Int): List<T> {
+        val l = pending[slot].toList()
+        pending[slot].clear()
+        queued[slot] = false
+        return l
+    }
+
+    @Synchronized
+    fun takeDropped(): Int = dropped.also { dropped = 0 }
 }

@@ -3025,6 +3025,7 @@ static constexpr size_t HOOKUP_SLOT_SIZE = 53248;
 static constexpr size_t HOOKUP_SIZE = HOOKUP_HEADER_SIZE + HOOKUP_SLOTS * HOOKUP_SLOT_SIZE;
 static constexpr int HOOKUP_FEATURE_TIMEOUT_MS = 1000;
 static constexpr int HOOKUP_OUTPUT_WAIT_MS = 50;
+static constexpr int HOOKUP_FUTEX_WAIT = 0;  // FUTEX_WAIT, shared: the writer is the SDL3 bridge, another process
 
 struct HookupReport {
   uint64_t seq;
@@ -3050,7 +3051,8 @@ struct HookupSlot {
   uint32_t get_report_id;  // low byte: report id; bit 8: input report (HIDIOCGINPUT) instead of feature
   int32_t get_length;
   uint8_t get[HOOKUP_REPORT_MAX];
-  uint8_t reserved[1024 - 520];
+  uint64_t direct_ms;  // SDL3 bridge heartbeat (CLOCK_MONOTONIC ms) while it writes this slot itself (fast path)
+  uint8_t reserved[1024 - 528];
   uint8_t desc[HOOKUP_DESC_MAX];
   HookupReport in[HOOKUP_IN_FIFO];
   HookupReport out[HOOKUP_OUT_FIFO];
@@ -3077,6 +3079,7 @@ static_assert(offsetof(HookupSlot, product_name) == 280, "hookup product offset"
 static_assert(offsetof(HookupSlot, in_write) == 344, "hookup in_write offset");
 static_assert(offsetof(HookupSlot, get_report_id) == 384, "hookup get_report_id offset");
 static_assert(offsetof(HookupSlot, get) == 392, "hookup get offset");
+static_assert(offsetof(HookupSlot, direct_ms) == 520, "hookup direct_ms offset");
 static_assert(offsetof(HookupSlot, desc) == 1024, "hookup desc offset");
 static_assert(offsetof(HookupSlot, in) == 5120, "hookup in offset");
 static_assert(offsetof(HookupSlot, out) == 41984, "hookup out offset");
@@ -3151,6 +3154,8 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
   delete holder;
   HookupSlot *s = hookup_slot(self->hookup);
   uint64_t next = s ? __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE) : 0;
+  unsigned unread = 0;
+  uint64_t meter_us = monotonic_us();
   while (s && __atomic_load_n(&s->present, __ATOMIC_ACQUIRE) &&
          __atomic_load_n(&s->generation, __ATOMIC_ACQUIRE) == self->hookup_generation) {
     uint64_t written = __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE);
@@ -3166,13 +3171,31 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
       bool intact = __atomic_load_n(&r.seq, __ATOMIC_ACQUIRE) == next + 1;
       next++;
       if (!intact || !length) continue;
-      if (send(self->peer, data, length, MSG_DONTWAIT | MSG_NOSIGNAL) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        failed = true;
-        break;
+      if (send(self->peer, data, length, MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+          failed = true;
+          break;
+        }
+        unread++;  // Steam has not read the previous reports yet
       }
     }
     if (failed) break;
-    sleep_us(500);
+    // Lag meter: reports Steam did not read in time (its socket was full), logged every 10 s when it happened.
+    uint64_t now_us = monotonic_us();
+    if (now_us - meter_us >= 10000000ULL) {
+      if (unread)
+        Logger::log("hookup: /dev/hidraw%u: Steam read too slowly, %u reports not taken in the last 10 s\n",
+                    HOOKUP_MINOR_BASE + self->hookup, unread);
+      unread = 0;
+      meter_us = now_us;
+    }
+    // Sleep until the next report. The SDL3 bridge's fast path wakes this futex the moment it writes one (the
+    // low half of in_write changes); reports relayed by DroidDeck's app are picked up by the timeout.
+    uint64_t beat = __atomic_load_n(&s->direct_ms, __ATOMIC_ACQUIRE);
+    bool fast = beat && monotonic_us() / 1000 - beat < 1500;
+    struct timespec wait = {0, (fast ? 4000L : 500L) * 1000L};
+    syscall(SYS_futex, reinterpret_cast<uint32_t *>(&s->in_write), HOOKUP_FUTEX_WAIT, static_cast<uint32_t>(written),
+            &wait, nullptr, 0);
   }
   syscall(SYS_close, self->peer);
   return nullptr;
@@ -3186,7 +3209,9 @@ __attribute__((visibility("hidden"))) static int open_hookup_hidraw(int flags, i
   }
   int pair[2];
   if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) < 0) return -1;
-  int buffer = HOOKUP_REPORT_MAX * 64;
+  // Small, like DroidDeck's own controller nodes (about 6 reports): when Steam reads slower than the controller
+  // sends, it gets near-current input instead of working through a long line of old reports.
+  int buffer = HOOKUP_REPORT_MAX * 4;
   setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
   if (!(flags & O_CLOEXEC)) fcntl(pair[0], F_SETFD, 0);
   if (flags & O_NONBLOCK) fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL) | O_NONBLOCK);
