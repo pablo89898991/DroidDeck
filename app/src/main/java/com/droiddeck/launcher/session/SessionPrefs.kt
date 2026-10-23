@@ -263,6 +263,19 @@ object SessionPrefs {
     const val GPU_DRIVERS_MANUAL = "manual"
     const val GPU_DRIVERS_MIX = "mix"
 
+    const val TP_UBWC_AUTO = "auto"
+    const val TP_UBWC_ON = "on"
+    const val TP_UBWC_OFF = "off"
+
+    fun tpUbwcMode(context: Context): String =
+        prefs(context).getString("tpUbwcMode", TP_UBWC_AUTO)
+            ?.takeIf { it in setOf(TP_UBWC_AUTO, TP_UBWC_ON, TP_UBWC_OFF) } ?: TP_UBWC_AUTO
+
+    fun setTpUbwcMode(context: Context, mode: String) {
+        require(mode in setOf(TP_UBWC_AUTO, TP_UBWC_ON, TP_UBWC_OFF))
+        prefs(context).edit().putString("tpUbwcMode", mode).commit()
+    }
+
     fun gpuDriverMode(context: Context): String =
         prefs(context).getString("gpuDriverMode", GPU_DRIVERS_AUTO) ?: GPU_DRIVERS_AUTO
 
@@ -474,6 +487,13 @@ object SessionPrefs {
 
     fun setProotFastPath(context: Context, on: Boolean) {
         prefs(context).edit().putBoolean("prootFastPath", on).apply()
+    }
+
+    /** gamescope draws the cursor itself. Off by default: on a phone that plane costs frames. */
+    fun cursorComposite(context: Context): Boolean = prefs(context).getBoolean("cursorComposite", false)
+
+    fun setCursorComposite(context: Context, on: Boolean) {
+        prefs(context).edit().putBoolean("cursorComposite", on).apply()
     }
 
     const val DEFAULT_GUEST_HOSTNAME = "DroidDeck"
