@@ -1519,6 +1519,10 @@ build_deck_report(uint8_t *report, uint32_t packet, uint32_t buttons, const int3
   put16(report + 54, stick(-axes[3]));
 }
 
+// sdl3bridge: Steam reads the newest reports of every controller (mailbox, see HookupQueue)
+static void pad_mailbox_attach(DeckHidraw &pad);
+static int pad_mailbox_offer(DeckHidraw &pad, const uint8_t *data, uint32_t length);
+
 __attribute__((visibility("hidden"))) static void *deck_report_thread(void *arg) {
   auto *deck = static_cast<std::shared_ptr<DeckHidraw> *>(arg);
   std::shared_ptr<DeckHidraw> self = *deck;
@@ -1536,9 +1540,7 @@ __attribute__((visibility("hidden"))) static void *deck_report_thread(void *arg)
     read_deck_extras(*self, extras);
     uint8_t report[DECK_REPORT_BYTES];
     build_deck_report(report, ++packet, buttons, axes, extras);
-    if (send(self->peer, report, sizeof(report), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
-        errno != EAGAIN && errno != EWOULDBLOCK)
-      break;
+    if (pad_mailbox_offer(*self, report, sizeof(report)) < 0) break;
     sleep_us(controller_report_interval_us(DECK_REPORT_INTERVAL_US));
   }
   syscall(SYS_close, self->peer);
@@ -1664,9 +1666,7 @@ __attribute__((visibility("hidden"))) static void *sony_report_thread(void *arg)
     read_deck_extras(*self, extras);
     uint8_t report[SONY_REPORT_BYTES];
     build_sony_report(report, self->sony, ++packet, monotonic_us() - start_us, buttons, axes, extras, touch);
-    if (send(self->peer, report, sizeof(report), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
-        errno != EAGAIN && errno != EWOULDBLOCK)
-      break;
+    if (pad_mailbox_offer(*self, report, sizeof(report)) < 0) break;
     sleep_us(controller_report_interval_us(DECK_REPORT_INTERVAL_US));
   }
   syscall(SYS_close, self->peer);
@@ -1777,9 +1777,7 @@ __attribute__((visibility("hidden"))) static void *sc1_report_thread(void *arg) 
     read_deck_extras(*self, extras);
     uint8_t report[DECK_REPORT_BYTES];
     build_sc1_report(report, ++packet, buttons, axes, extras);
-    if (send(self->peer, report, sizeof(report), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
-        errno != EAGAIN && errno != EWOULDBLOCK)
-      break;
+    if (pad_mailbox_offer(*self, report, sizeof(report)) < 0) break;
     sleep_us(controller_report_interval_us(DECK_REPORT_INTERVAL_US));
   }
   syscall(SYS_close, self->peer);
@@ -1833,6 +1831,7 @@ __attribute__((visibility("hidden"))) static int open_deck_hidraw(int flags, uin
   deck->mapping_size = mapping_size;
   deck->sony = sony;
   deck->sc1 = sc1;
+  pad_mailbox_attach(*deck);
   {
     std::lock_guard<std::recursive_mutex> guard(controller_mutex());
     deck_map()[pair[0]] = deck;
@@ -1891,9 +1890,7 @@ __attribute__((visibility("hidden"))) static void *triton_report_thread(void *ar
   while (triton_connected()) {
     if (read_triton_state(*self, report_id, report + 1, length)) {
       report[0] = report_id;
-      if (send(self->peer, report, length + 1, MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
-          errno != EAGAIN && errno != EWOULDBLOCK)
-        break;
+      if (pad_mailbox_offer(*self, report, static_cast<uint32_t>(length + 1)) < 0) break;
     }
     sleep_us(controller_report_interval_us(TRITON_REPORT_INTERVAL_US));
   }
@@ -1988,9 +1985,7 @@ __attribute__((visibility("hidden"))) static void *triton_pad_thread(void *arg) 
     uint8_t report[TRITON_REPORT_ID_BYTES + TRITON_STATE_BYTES];
     report[0] = TRITON_STATE_WIRED;
     build_triton_report(report + 1, ++packet, monotonic_us() - start_us, buttons, axes, extras);
-    if (send(self->peer, report, sizeof(report), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
-        errno != EAGAIN && errno != EWOULDBLOCK)
-      break;
+    if (pad_mailbox_offer(*self, report, sizeof(report)) < 0) break;
     sleep_us(controller_report_interval_us(TRITON_REPORT_INTERVAL_US));
   }
   syscall(SYS_close, self->peer);
@@ -2042,6 +2037,7 @@ __attribute__((visibility("hidden"))) static int open_triton_hidraw(int flags, b
   triton->mapping_size = mapping_size;
   triton->triton = true;
   triton->emulated = emulated;
+  pad_mailbox_attach(*triton);
   {
     std::lock_guard<std::recursive_mutex> guard(controller_mutex());
     deck_map()[pair[0]] = triton;
@@ -3410,7 +3406,8 @@ struct HookupReportKind {
   }
   /**
    * For the latency meter, any controller: a button press since `ref` -- a declared button (HID descriptor) that
-   * turned on, or, for controllers that declare none, a learned non-moving bit that turned on.
+   * turned on, or, for controllers that declare none, a learned non-moving bit that turned on (not the carry of an
+   * analog value crossing a boundary, as in loses_change).
    */
   bool press(const uint8_t *d, const uint8_t *ref) const {
     bool declared = false;
@@ -3420,44 +3417,169 @@ struct HookupReportKind {
       if (d[i] & ~ref[i] & buttons[i]) return true;
     }
     if (declared || !learned) return false;
-    for (uint32_t i = 0; i < length; i++)
-      if (d[i] & ~ref[i] & ~moving[i]) return true;
+    for (uint32_t i = 0; i < length; i++) {
+      uint8_t changed = d[i] ^ ref[i];
+      uint8_t rises = d[i] & changed & ~moving[i];
+      if (!rises) continue;
+      int delta = static_cast<int8_t>(d[i] - ref[i]);
+      if (i > 0 && analog[i - 1] && delta >= -3 && delta <= 3) continue;
+      for (uint32_t r = rises; r; r &= r - 1)
+        if (!(changed & ((1u << __builtin_ctz(r)) - 1))) return true;
+    }
     return false;
   }
 };
 
 /**
- * Controller reports -> Steam's /dev/hidraw node, for every controller: a mailbox read at the moment Steam reads.
- * The report thread keeps the reports Steam has not read yet; Steam's read() of the node is answered from here
- * (hookup_read_steam), and the node's socket only carries a 1-byte "something to read" token, so poll() works
- * as on a real node. Latest wins: a newer report replaces the waiting one, so whenever Steam reads, it gets the
- * newest state -- even when it reads late. A report is only kept (and reaches Steam in order) when replacing it
- * would lose a change: a button-like bit that changed and changed back before Steam read it, like a press shorter
- * than Steam's read cycle (HookupReportKind::loses_change). Reports of kinds that don't stream are never replaced.
+ * Controller reports -> Steam, for every controller: the hooked-up ones (/dev/hidraw24-27) and DroidDeck's own pads
+ * (Steam Deck, DualSense / Edge, DualShock 4, Steam Controller 2015 / 2026). A mailbox read at the moment Steam
+ * reads: the report thread puts reports here, Steam's read() of the node is answered from here (hookup_read_steam),
+ * and the node's socket only carries a 1-byte "something to read" token, so poll() works as on a real node.
+ *
+ * How the reports are handed over follows how Steam reads, learned while it runs:
+ *  - Steam takes everything waiting each time (like SDL's update loop): it gets every report, in order, the newest
+ *    last -- the newest state is in that same read, and gyro / touch keep all their samples.
+ *  - Steam takes one report and goes away (busy): it gets the newest one. Older ones are skipped, unless skipping
+ *    one would lose a change: a button-like bit that changed and changed back before Steam read it, like a press
+ *    shorter than Steam's read cycle (HookupReportKind::loses_change). Those reach Steam, in order.
+ * At most 8 reports wait; beyond that the oldest skippable one goes. Reports of kinds that don't stream (replies to
+ * Steam's commands, status) are never skipped.
  * (Before, reports went into a small socket queue: when Steam read slowly it filled up, the NEWEST reports were the
  * ones dropped and Steam read old ones -- a press could reach it one or more of its read cycles late.)
  */
 struct HookupQueue {
   struct Entry {
-    int kind;            // index in kinds, -1 = beyond the 4 kinds tracked (always kept)
-    bool kept;           // never replaced or dropped before Steam reads it
+    int kind;            // index in kinds, -1 = beyond the 4 kinds tracked (never skipped)
     uint32_t length;
     uint64_t arrived_us;
     uint8_t data[HOOKUP_REPORT_MAX];
   };
-  static constexpr int MAX = 16;
+  static constexpr int MAX = 8;
   std::mutex lock;
-  Entry entries[MAX];
+  Entry entries[MAX + 1];
   int n = 0;
   HookupReportKind kinds[4];
   int nkinds = 0;
-  bool token = false;    // the "something to read" byte is in Steam's socket
-  bool closed = false;   // the report thread ended (controller gone)
-  uint64_t press_at_arrival = 0;   // latency meter: arrival time of the entry that carries a new press
+  bool token = false;          // the "something to read" byte is in Steam's socket
+  bool closed = false;         // the report thread ended (controller gone)
+  bool drains = false;         // learned: Steam takes everything waiting each time
+  uint64_t last_read_us = 0;   // Steam's last read that got a report
+  uint64_t peer_check_us = 0;
+  uint32_t mode_logs = 0;
+  char name[64] = {};
   // 10 s summary
-  uint32_t arrived = 0, handed = 0, replaced = 0, lost = 0;
+  uint64_t meter_us = 0;
+  uint32_t arrived = 0, handed = 0, skipped = 0, lost = 0;
   uint64_t wait_sum_us = 0, wait_max_us = 0;
 };
+
+/** Reads this close together are one read cycle of Steam's. */
+static constexpr uint64_t HOOKUP_CYCLE_GAP_US = 1000;
+
+/** What Steam has, or will have, before entry i of its kind: the previous one waiting, or the last one it got. */
+__attribute__((visibility("hidden"))) static const uint8_t *hookup_base(const HookupQueue &q, int i) {
+  int kind = q.entries[i].kind;
+  for (int j = i - 1; j >= 0; j--)
+    if (q.entries[j].kind == kind) return q.entries[j].data;
+  return q.kinds[kind].has_given ? q.kinds[kind].given : nullptr;
+}
+
+/** Entry i can be skipped: a newer report of its kind waits behind it, and skipping i loses no change. */
+__attribute__((visibility("hidden"))) static bool hookup_skippable(const HookupQueue &q, int i) {
+  const HookupQueue::Entry &e = q.entries[i];
+  if (e.kind < 0 || !q.kinds[e.kind].learned) return false;
+  for (int j = i + 1; j < q.n; j++) {
+    if (q.entries[j].kind != e.kind) continue;
+    const uint8_t *base = hookup_base(q, i);
+    return !base || !q.kinds[e.kind].loses_change(e.data, q.entries[j].data, base);
+  }
+  return false;
+}
+
+__attribute__((visibility("hidden"))) static void hookup_remove(HookupQueue &q, int i) {
+  for (int j = i; j < q.n - 1; j++) q.entries[j] = q.entries[j + 1];
+  q.n--;
+}
+
+__attribute__((visibility("hidden"))) static void hookup_set_mode(HookupQueue &q, bool drains) {
+  q.drains = drains;
+  if (q.mode_logs++ < 4)
+    Logger::log("%s: %s\n", q.name,
+                drains ? "Steam takes every report waiting each time: it gets them all, in order, the newest last"
+                       : "Steam reads one report at a time: it gets the newest (older ones are skipped unless that "
+                         "would lose a press)");
+}
+
+/**
+ * A new report for Steam, from a report thread. `slot` = the hooked-up controller (its HID report descriptor marks
+ * the buttons), or null for DroidDeck's own pads. Returns -1 once Steam has closed the node (the thread ends).
+ */
+__attribute__((visibility("hidden"))) static int hookup_offer(HookupQueue &q, int peer, const HookupSlot *slot,
+                                                              const uint8_t *data, uint32_t length) {
+  if (length > HOOKUP_REPORT_MAX) length = HOOKUP_REPORT_MAX;
+  if (!length) return 0;
+  uint64_t now = monotonic_us();
+  std::lock_guard<std::mutex> guard(q.lock);
+  q.arrived++;
+  int kind = -1;
+  for (int i = 0; i < q.nkinds && kind < 0; i++)
+    if (q.kinds[i].length == length && q.kinds[i].id == data[0]) kind = i;
+  if (kind < 0 && q.nkinds < 4) {
+    HookupReportKind &k = q.kinds[q.nkinds];
+    k.length = length;
+    k.id = data[0];
+    if (slot) {
+      hookup_descriptor_buttons(*slot, data[0], k.buttons, length);  // report IDs: byte 0 is the ID
+      uint8_t no_ids[HOOKUP_REPORT_MAX] = {};
+      hookup_descriptor_buttons(*slot, 0, no_ids, length);           // no IDs: the report starts at once
+      for (uint32_t i = 0; i < length; i++) k.buttons[i] |= no_ids[i];
+    }
+    kind = q.nkinds++;
+  }
+  if (kind >= 0) q.kinds[kind].learn(data, now);
+  HookupQueue::Entry &e = q.entries[q.n++];
+  e.kind = kind;
+  e.length = length;
+  e.arrived_us = now;
+  memcpy(e.data, data, length);
+  if (q.n > HookupQueue::MAX) {  // Steam hasn't read for a while: make room, the oldest skippable report first
+    int drop = -1;
+    for (int i = 0; i < q.n - 1 && drop < 0; i++)
+      if (hookup_skippable(q, i)) drop = i;
+    if (drop >= 0) {
+      q.skipped++;
+    } else {
+      drop = 0;
+      if (q.entries[0].kind >= 0 && q.kinds[q.entries[0].kind].learned) q.lost++;
+    }
+    hookup_remove(q, drop);
+  }
+  if (!q.token) {  // tell Steam's poll() there is something to read
+    uint8_t token = 1;
+    if (send(peer, &token, 1, MSG_DONTWAIT | MSG_NOSIGNAL) == 1) q.token = true;
+    else if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;  // Steam closed the node
+  } else if (now - q.peer_check_us > 100000) {  // the token is waiting: did Steam close the node meanwhile?
+    q.peer_check_us = now;
+    struct pollfd p = {peer, 0, 0};
+    struct timespec zero = {0, 0};
+    if (syscall(SYS_ppoll, &p, 1, &zero, nullptr, 0) > 0 && (p.revents & (POLLHUP | POLLERR))) return -1;
+  }
+  // 10 s summary, logged when Steam was slow to read (skipping reports, or reading them late)
+  if (!q.meter_us) q.meter_us = now;
+  if (now - q.meter_us >= 10000000ULL) {
+    double secs = (now - q.meter_us) / 1e6;
+    if (q.skipped || q.lost || (q.handed && q.wait_sum_us / q.handed > 2000))
+      Logger::log("%s: %.0f reports/s, Steam read %.0f/s (%s), avg %.1f ms after they arrived (max %.1f ms); %u older "
+                  "ones skipped while Steam was busy%s\n",
+                  q.name, q.arrived / secs, q.handed / secs, q.drains ? "all waiting each time" : "the newest each time",
+                  q.handed ? q.wait_sum_us / 1000.0 / q.handed : 0.0, q.wait_max_us / 1000.0, q.skipped,
+                  q.lost ? " -- Steam stopped reading for a while, some short presses were dropped" : "");
+    q.arrived = q.handed = q.skipped = q.lost = 0;
+    q.wait_sum_us = q.wait_max_us = 0;
+    q.meter_us = now;
+  }
+  return 0;
+}
 
 /** Steam process, as Steam reads a report from the mailbox: step 1 of the latency meter, and the start of step 2. */
 __attribute__((visibility("hidden"))) static void hookup_meter_handed(HookupQueue &q, const HookupQueue::Entry &e,
@@ -3471,20 +3593,33 @@ __attribute__((visibility("hidden"))) static void hookup_meter_handed(HookupQueu
   static HookupLatency stat;
   stat.add("button press waited for Steam to read it", wait, now);
   g_hookup_press_us.store(now, std::memory_order_release);
-  int sample = g_hookup_samples.load(std::memory_order_relaxed);
+  static std::atomic<int> samples{0};
+  int sample = samples.fetch_add(1, std::memory_order_relaxed);
   if (sample < 12) Logger::log("latency: press %d: Steam read it %.1f ms after it arrived\n", sample + 1, wait / 1000.0);
 }
 
-/** Steam's read() of a hooked-up node: the next report from the mailbox (see HookupQueue). */
+/** Steam's read() of a controller node with a mailbox: the next report (see HookupQueue). */
 __attribute__((visibility("hidden"))) static ssize_t hookup_read_steam(int fd, HookupQueue &q, void *buf, size_t count) {
-  hookup_boost_this_thread("reads a hooked-up controller");
+  hookup_boost_this_thread("reads a controller");
   for (;;) {
     {
       std::lock_guard<std::mutex> guard(q.lock);
+      uint64_t now = monotonic_us();
+      bool new_cycle = !q.last_read_us || now - q.last_read_us >= HOOKUP_CYCLE_GAP_US;
       if (q.n) {
+        // back after a while, and a report it left waiting last time is still here: it reads one at a time
+        if (new_cycle && q.drains && q.entries[0].arrived_us < q.last_read_us) hookup_set_mode(q, false);
+        if (!q.drains)  // the newest, minus what can't be skipped
+          for (int i = 0; i < q.n - 1;) {
+            if (hookup_skippable(q, i)) {
+              hookup_remove(q, i);
+              q.skipped++;
+            } else {
+              i++;
+            }
+          }
         HookupQueue::Entry e = q.entries[0];
-        for (int i = 0; i < q.n - 1; i++) q.entries[i] = q.entries[i + 1];
-        q.n--;
+        hookup_remove(q, 0);
         if (!q.n && q.token) {  // nothing left: take the token back so poll() reports "nothing to read"
           uint8_t token;
           if (recv(fd, &token, 1, MSG_DONTWAIT) < 0) {}
@@ -3492,14 +3627,18 @@ __attribute__((visibility("hidden"))) static ssize_t hookup_read_steam(int fd, H
         }
         size_t copied = std::min<size_t>(count, e.length);
         memcpy(buf, e.data, copied);
-        hookup_meter_handed(q, e, monotonic_us());
+        hookup_meter_handed(q, e, now);
         if (e.kind >= 0) {
           memcpy(q.kinds[e.kind].given, e.data, e.length);
           q.kinds[e.kind].has_given = true;
         }
+        q.last_read_us = now;
         return static_cast<ssize_t>(copied);
       }
+      if (!new_cycle && !q.drains) hookup_set_mode(q, true);  // came straight back for more: it takes all waiting
       if (q.closed) return 0;  // the controller is gone: end of file, as on a real node
+      uint8_t peek;
+      if (recv(fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT) == 0) return 0;  // the report thread ended: end of file
     }
     int flags = fcntl(fd, F_GETFL);
     if (flags >= 0 && (flags & O_NONBLOCK)) {
@@ -3515,6 +3654,58 @@ __attribute__((visibility("hidden"))) static ssize_t hookup_read_steam(int fd, H
   }
 }
 
+/** readv() of a node with a mailbox: one report, as read() gives it, spread over the buffers. -2 = not one. */
+__attribute__((visibility("hidden"))) static ssize_t hookup_readv_mailbox(int fd, const struct iovec *iov, int iovcnt) {
+  if (!watched(fd)) return -2;
+  std::shared_ptr<HookupQueue> q;
+  {
+    std::lock_guard<std::recursive_mutex> guard(controller_mutex());
+    auto deck = deck_map().find(fd);
+    if (deck == deck_map().end() || !deck->second->hookup_in) return -2;
+    q = deck->second->hookup_in;
+  }
+  if (iovcnt < 0 || iovcnt > IOV_MAX || (iovcnt && !iov)) {
+    errno = EINVAL;
+    return -1;
+  }
+  size_t total = 0;
+  for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
+  uint8_t report[HOOKUP_REPORT_MAX];
+  ssize_t got = hookup_read_steam(fd, *q, report, std::min<size_t>(total, sizeof(report)));
+  size_t done = 0;
+  for (int i = 0; i < iovcnt && got > 0 && done < static_cast<size_t>(got); i++) {
+    size_t part = std::min(iov[i].iov_len, static_cast<size_t>(got) - done);
+    memcpy(iov[i].iov_base, report + done, part);
+    done += part;
+  }
+  return got;
+}
+
+// ---- DroidDeck's own controller nodes (Steam Deck pad, DualSense / Edge, DualShock 4, Steam Controller 2015 and
+// 2026): the same mailbox, so Steam reads the newest state of every controller, not only hooked-up ones ----
+__attribute__((visibility("hidden"))) static void pad_mailbox_attach(DeckHidraw &pad) {
+  pad.hookup_in = std::make_shared<HookupQueue>();
+  const char *what = pad.triton ? (pad.emulated ? "Steam Controller (2026) pad" : "Steam Controller (2026)")
+                   : pad.sc1 ? "Steam Controller (2015) pad"
+                   : pad.sony == 4 ? "DualShock 4 pad"
+                   : pad.sony == 6 ? "DualSense Edge pad"
+                   : pad.sony ? "DualSense pad"
+                   : "Steam Deck pad";
+  snprintf(pad.hookup_in->name, sizeof(pad.hookup_in->name), "deck: %s", what);
+}
+
+/** A report of one of DroidDeck's own pads for Steam. -1 = Steam closed the node (the report thread ends). */
+__attribute__((visibility("hidden"))) static int pad_mailbox_offer(DeckHidraw &pad, const uint8_t *data,
+                                                                   uint32_t length) {
+  hookup_boost_this_thread("hands DroidDeck's controller reports to Steam");
+  if (!pad.hookup_in) {  // no mailbox: straight into the node's socket, as DroidDeck does
+    if (send(pad.peer, data, length, MSG_DONTWAIT | MSG_NOSIGNAL) < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+      return -1;
+    return 0;
+  }
+  return hookup_offer(*pad.hookup_in, pad.peer, nullptr, data, length);
+}
+
 __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *arg) {
   auto *holder = static_cast<std::shared_ptr<DeckHidraw> *>(arg);
   std::shared_ptr<DeckHidraw> self = *holder;
@@ -3524,96 +3715,24 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
   HookupQueue &q = *qp;
   hookup_boost_this_thread("hands controller reports to Steam");
   uint64_t next = s ? __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE) : 0;
-  uint64_t meter_us = monotonic_us();
-  auto kind_of = [&](const uint8_t *d, uint32_t length) {
-    for (int i = 0; i < q.nkinds; i++)
-      if (q.kinds[i].length == length && q.kinds[i].id == d[0]) return i;
-    if (q.nkinds == 4) return -1;
-    HookupReportKind &k = q.kinds[q.nkinds];
-    k.length = length;
-    k.id = d[0];
-    hookup_descriptor_buttons(*s, d[0], k.buttons, length);       // report IDs: byte 0 is the ID
-    uint8_t no_ids[HOOKUP_REPORT_MAX] = {};
-    hookup_descriptor_buttons(*s, 0, no_ids, length);              // no IDs: the report starts at once
-    for (uint32_t i = 0; i < length; i++) k.buttons[i] |= no_ids[i];
-    return q.nkinds++;
-  };
   bool peer_gone = false;
   while (s && __atomic_load_n(&s->present, __ATOMIC_ACQUIRE) &&
          __atomic_load_n(&s->generation, __ATOMIC_ACQUIRE) == self->hookup_generation) {
     uint64_t written = __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE);
     if (written - next > HOOKUP_IN_FIFO) next = written - HOOKUP_IN_FIFO;  // fell behind: skip the oldest
-    while (next < written) {
+    while (next < written && !peer_gone) {
       const HookupReport &r = s->in[next % HOOKUP_IN_FIFO];
-      HookupQueue::Entry e;
+      uint8_t data[HOOKUP_REPORT_MAX];
       uint32_t length = __atomic_load_n(&r.length, __ATOMIC_RELAXED);
       if (length > HOOKUP_REPORT_MAX) length = HOOKUP_REPORT_MAX;
-      memcpy(e.data, r.data, length);
+      memcpy(data, r.data, length);
       __atomic_thread_fence(__ATOMIC_ACQUIRE);
       bool intact = __atomic_load_n(&r.seq, __ATOMIC_ACQUIRE) == next + 1;
       next++;
       if (!intact || !length) continue;
-      uint64_t now = monotonic_us();
-      e.length = length;
-      e.arrived_us = now;
-      std::lock_guard<std::mutex> guard(q.lock);
-      q.arrived++;
-      e.kind = kind_of(e.data, length);
-      HookupReportKind *k = e.kind >= 0 ? &q.kinds[e.kind] : nullptr;
-      e.kept = !k;
-      if (k) k->learn(e.data, now);
-      // the newest replaceable report of the same kind waiting, and what Steam has / will get before it
-      int last = -1;
-      for (int i = q.n - 1; i >= 0 && k && k->learned; i--)
-        if (q.entries[i].kind == e.kind && !q.entries[i].kept) { last = i; break; }
-      bool replaced = false;
-      if (last >= 0) {
-        const uint8_t *base = nullptr;
-        for (int i = last - 1; i >= 0 && !base; i--)
-          if (q.entries[i].kind == e.kind) base = q.entries[i].data;
-        if (!base && k->has_given) base = k->given;
-        if (base && !k->loses_change(q.entries[last].data, e.data, base)) {
-          q.entries[last] = e;  // latest wins
-          q.replaced++;
-          replaced = true;
-        } else {
-          q.entries[last].kept = true;  // it carries a change the new one undoes: it must reach Steam
-        }
-      }
-      if (!replaced) {
-        if (q.n == HookupQueue::MAX) {  // Steam stopped reading for a while: make room, oldest replaceable first
-          int drop = 0;
-          for (int i = 0; i < q.n; i++)
-            if (!q.entries[i].kept) { drop = i; break; }
-          if (!q.entries[drop].kept) q.replaced++;
-          else if (q.entries[drop].kind >= 0 && q.kinds[q.entries[drop].kind].learned) q.lost++;
-          for (int i = drop; i < q.n - 1; i++) q.entries[i] = q.entries[i + 1];
-          q.n--;
-        }
-        q.entries[q.n++] = e;
-      }
-      if (!q.token && !peer_gone) {  // tell Steam's poll() there is something to read
-        uint8_t token = 1;
-        if (send(self->peer, &token, 1, MSG_DONTWAIT | MSG_NOSIGNAL) == 1) q.token = true;
-        else if (errno != EAGAIN && errno != EWOULDBLOCK) peer_gone = true;
-      }
+      if (hookup_offer(q, self->peer, s, data, length) < 0) peer_gone = true;
     }
     if (peer_gone) break;  // Steam closed the node
-    // 10 s summary, logged when Steam was slow to read (replacing reports, or reading them late)
-    uint64_t now_us = monotonic_us();
-    if (now_us - meter_us >= 10000000ULL) {
-      std::lock_guard<std::mutex> guard(q.lock);
-      double secs = (now_us - meter_us) / 1e6;
-      if (q.replaced || q.lost || (q.handed && q.wait_sum_us / q.handed > 2000))
-        Logger::log("hookup: /dev/hidraw%u: %.0f reports/s from the controller, Steam read %.0f/s, each the newest "
-                    "(avg %.1f ms after it arrived, max %.1f ms); %u replaced by a newer one while Steam was busy%s\n",
-                    HOOKUP_MINOR_BASE + self->hookup, q.arrived / secs, q.handed / secs,
-                    q.handed ? q.wait_sum_us / 1000.0 / q.handed : 0.0, q.wait_max_us / 1000.0, q.replaced,
-                    q.lost ? " -- Steam stopped reading for a while, some short presses were dropped" : "");
-      q.arrived = q.handed = q.replaced = q.lost = 0;
-      q.wait_sum_us = q.wait_max_us = 0;
-      meter_us = now_us;
-    }
     // Sleep until the next report. The SDL3 bridge's fast path wakes this futex the moment it writes one (the
     // low half of in_write changes); reports relayed by DroidDeck's app are picked up by the timeout.
     uint64_t beat = __atomic_load_n(&s->direct_ms, __ATOMIC_ACQUIRE);
@@ -3648,6 +3767,7 @@ __attribute__((visibility("hidden"))) static int open_hookup_hidraw(int flags, i
   pad->hookup = static_cast<int8_t>(slot);
   pad->hookup_generation = __atomic_load_n(&s->generation, __ATOMIC_ACQUIRE);
   pad->hookup_in = std::make_shared<HookupQueue>();
+  snprintf(pad->hookup_in->name, sizeof(pad->hookup_in->name), "hookup: /dev/hidraw%u", HOOKUP_MINOR_BASE + slot);
   {
     std::lock_guard<std::recursive_mutex> guard(controller_mutex());
     deck_map()[pair[0]] = pad;
@@ -3865,11 +3985,11 @@ __attribute__((visibility("hidden"))) static ssize_t hookup_read_uinput(int fd, 
   std::unique_lock<std::recursive_mutex> guard(controller_mutex());
   auto made = uinput_map().find(fd);
   if (made == uinput_map().end()) {
-    // Steam reading a hooked-up controller: answered from its mailbox (HookupQueue), unlocked
+    // Steam reading a controller node with a mailbox (HookupQueue): answered from it, unlocked
     auto deck = deck_map().find(fd);
     if (deck == deck_map().end()) return -2;
-    if (deck->second->hookup < 0 || !deck->second->hookup_in) {  // one of DroidDeck's own pads
-      hookup_boost_this_thread("reads DroidDeck's controller");
+    if (!deck->second->hookup_in) {  // a node without one (touch screen, or the pad mailbox not patched in)
+      if (!deck->second->touch) hookup_boost_this_thread("reads DroidDeck's controller");
       return -2;
     }
     std::shared_ptr<HookupQueue> q = deck->second->hookup_in;
@@ -4948,7 +5068,18 @@ EXPORT ssize_t read(int fd, void *buf, size_t count) {
   return read_input(fd, buf, count);
 }
 
+// sdl3bridge: read() as programs built with _FORTIFY_SOURCE call it
+EXPORT ssize_t __read_chk(int fd, void *buf, size_t count, size_t buflen) {
+  if (count > buflen) {  // a buffer overflow: the C library reports it, as it would without the hook
+    static auto real = reinterpret_cast<ssize_t (*)(int, void *, size_t, size_t)>(dlsym(RTLD_NEXT, "__read_chk"));
+    if (real) return real(fd, buf, count, buflen);
+    abort();
+  }
+  return read_input(fd, buf, count);
+}
+
 EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
+  if (ssize_t mailbox = hookup_readv_mailbox(fd, iov, iovcnt); mailbox != -2) return mailbox;
   if (!is_fake_input_fd(fd)) return syscall(SYS_readv, fd, iov, iovcnt);
   if (iovcnt < 0 || iovcnt > IOV_MAX) {
     errno = EINVAL;
