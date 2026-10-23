@@ -61,11 +61,15 @@ object HookupBridge {
     private const val S_GET_REPORT_ID = 384
     private const val S_GET_LENGTH = 388
     private const val S_GET = 392
+    private const val S_DIRECT_MS = 520   // SDL3 bridge heartbeat while it serves the slot itself (fast path)
     private const val S_DESC = 1024
     private const val S_IN = 5120
     private const val S_OUT = 41984
 
     @Volatile private var map: MappedByteBuffer? = null
+    /** The shared file; handed to the SDL3 bridge as a descriptor so it can serve slots directly (fast path). */
+    @Volatile var shmFile: File? = null
+        private set
     @Volatile private var logFile: File? = null
 
     /** Also written to the session's pad.log, next to the native side's "hookup:" lines. */
@@ -96,6 +100,7 @@ object HookupBridge {
             m.putInt(0, MAGIC)
             map = m
         }
+        shmFile = file
         file.setReadable(true, false)
         file.setWritable(true, false)
         present.fill(false)
@@ -104,10 +109,23 @@ object HookupBridge {
     } catch (e: Exception) {
         note("hookup: no shared file: $e")
         map = null
+        shmFile = null
         null
     }
 
     private fun slotBase(slot: Int) = HEADER_SIZE + slot * SLOT_SIZE
+
+    /** Inode of the shared file (0 if none): the bridge reports the one it mapped, so a stale mapping is noticed. */
+    @JvmStatic fun shmInode(): Long = try { shmFile?.let { Os.stat(it.path).st_ino } ?: 0L } catch (_: Exception) { 0L }
+
+    /**
+     * The SDL3 bridge writes this slot's reports into the file itself and takes Steam's output / feature reads
+     * from it (its heartbeat is fresh): DroidDeck must leave the slot's FIFOs alone then.
+     */
+    private fun bridgeServes(m: ByteBuffer, slot: Int): Boolean {
+        val beat = m.getLong(slotBase(slot) + S_DIRECT_MS)
+        return beat != 0L && android.os.SystemClock.uptimeMillis() - beat < 1500
+    }
 
     @JvmStatic fun anyPresent(): Boolean = present.any { it }
     @JvmStatic fun isPresent(slot: Int): Boolean = slot in 0 until SLOTS && present[slot]
@@ -177,6 +195,7 @@ object HookupBridge {
     fun input(slot: Int, data: ByteArray) {
         val m = map ?: return
         if (slot !in 0 until SLOTS || !present[slot] || data.isEmpty()) return
+        if (bridgeServes(m, slot)) return   // a late message from before the fast path took over
         val base = slotBase(slot)
         val idx = m.getLong(base + S_IN_WRITE)
         val at = base + S_IN + ((idx % IN_FIFO).toInt()) * REPORT_SIZE
@@ -196,6 +215,7 @@ object HookupBridge {
         val m = map ?: return
         if (slot !in 0 until SLOTS) return
         m.putInt(slotBase(slot) + S_PRESENT, 0)
+        m.putLong(slotBase(slot) + S_DIRECT_MS, 0L)
         FakeInputWriter.storeFence()
         if (present[slot]) note("hookup: /dev/hidraw${MINOR_BASE + slot} unplugged")
         present[slot] = false
@@ -227,8 +247,9 @@ object HookupBridge {
         val m = map ?: return
         for (slot in 0 until SLOTS) {
             if (!present[slot]) continue
-            val base = slotBase(slot)
             FakeInputWriter.storeFence()
+            if (bridgeServes(m, slot)) continue   // the bridge takes Steam's reports from the file itself
+            val base = slotBase(slot)
             var read = m.getLong(base + S_OUT_READ)
             val written = m.getLong(base + S_OUT_WRITE)
             while (read < written) {

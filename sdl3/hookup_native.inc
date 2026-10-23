@@ -22,6 +22,7 @@ static constexpr size_t HOOKUP_SLOT_SIZE = 53248;
 static constexpr size_t HOOKUP_SIZE = HOOKUP_HEADER_SIZE + HOOKUP_SLOTS * HOOKUP_SLOT_SIZE;
 static constexpr int HOOKUP_FEATURE_TIMEOUT_MS = 1000;
 static constexpr int HOOKUP_OUTPUT_WAIT_MS = 50;
+static constexpr int HOOKUP_FUTEX_WAIT = 0;  // FUTEX_WAIT, shared: the writer is the SDL3 bridge, another process
 
 struct HookupReport {
   uint64_t seq;
@@ -47,7 +48,8 @@ struct HookupSlot {
   uint32_t get_report_id;  // low byte: report id; bit 8: input report (HIDIOCGINPUT) instead of feature
   int32_t get_length;
   uint8_t get[HOOKUP_REPORT_MAX];
-  uint8_t reserved[1024 - 520];
+  uint64_t direct_ms;  // SDL3 bridge heartbeat (CLOCK_MONOTONIC ms) while it writes this slot itself (fast path)
+  uint8_t reserved[1024 - 528];
   uint8_t desc[HOOKUP_DESC_MAX];
   HookupReport in[HOOKUP_IN_FIFO];
   HookupReport out[HOOKUP_OUT_FIFO];
@@ -74,6 +76,7 @@ static_assert(offsetof(HookupSlot, product_name) == 280, "hookup product offset"
 static_assert(offsetof(HookupSlot, in_write) == 344, "hookup in_write offset");
 static_assert(offsetof(HookupSlot, get_report_id) == 384, "hookup get_report_id offset");
 static_assert(offsetof(HookupSlot, get) == 392, "hookup get offset");
+static_assert(offsetof(HookupSlot, direct_ms) == 520, "hookup direct_ms offset");
 static_assert(offsetof(HookupSlot, desc) == 1024, "hookup desc offset");
 static_assert(offsetof(HookupSlot, in) == 5120, "hookup in offset");
 static_assert(offsetof(HookupSlot, out) == 41984, "hookup out offset");
@@ -169,7 +172,13 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
       }
     }
     if (failed) break;
-    sleep_us(500);
+    // Sleep until the next report. The SDL3 bridge's fast path wakes this futex the moment it writes one (the
+    // low half of in_write changes); reports relayed by DroidDeck's app are picked up by the timeout.
+    uint64_t beat = __atomic_load_n(&s->direct_ms, __ATOMIC_ACQUIRE);
+    bool fast = beat && monotonic_us() / 1000 - beat < 1500;
+    struct timespec wait = {0, (fast ? 4000L : 500L) * 1000L};
+    syscall(SYS_futex, reinterpret_cast<uint32_t *>(&s->in_write), HOOKUP_FUTEX_WAIT, static_cast<uint32_t>(written),
+            &wait, nullptr, 0);
   }
   syscall(SYS_close, self->peer);
   return nullptr;

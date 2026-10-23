@@ -58,6 +58,7 @@ object DualSenseBridge {
     private const val MSG_BRIDGE_LOG = 30
     // Background watchdog (like Steam on a PC: controllers are picked up whenever they appear)
     private const val MSG_HOOKUP_SYNC = 9      // -> bridge: "send me everything you hand over right now"
+    private const val MSG_HOOKUP_SHM = 25      // -> bridge: "fd" = the shared hook-up file (fast path)
     private const val MSG_HOOKUP_STATE = 24    // <- bridge: "slots": the hook-up slots that are live
     private const val WATCHDOG_MS = 1500L
     private const val SLOTS = 4
@@ -148,6 +149,9 @@ object DualSenseBridge {
                 MSG_HOOKUP_INPUT -> m.data.getByteArray("data")?.let { HookupBridge.input(m.data.getInt("slot"), it) }
                 MSG_HOOKUP_STATE -> {
                     val live = m.data.getIntArray("slots") ?: IntArray(0)
+                    // the bridge maps a different (or no) shared file: hand it the current one (at most every 10 s)
+                    if (m.data.getLong("fast_ino", 0L) != HookupBridge.shmInode() &&
+                        android.os.SystemClock.uptimeMillis() - shmSentMs > 10_000) sendShm()
                     for (s in 0 until HookupBridge.SLOTS) if (HookupBridge.isPresent(s) && s !in live) {
                         HookupBridge.note("hookup: the bridge no longer hands over slot $s; removing it")
                         HookupBridge.remove(s)
@@ -170,6 +174,7 @@ object DualSenseBridge {
         override fun onServiceConnected(n: ComponentName, b: IBinder) {
             server = Messenger(b)
             send(Message.obtain(null, MSG_REGISTER).apply { replyTo = inbox })
+            sendShm()
         }
         override fun onServiceDisconnected(n: ComponentName) {
             server = null; release()
@@ -192,6 +197,7 @@ object DualSenseBridge {
             // A new session screen while the old one is still being torn down (Android recreates it when you
             // come back from another app): keep the connection, and ask the bridge to resend its state.
             send(Message.obtain(null, MSG_REGISTER).apply { replyTo = inbox })
+            sendShm()
             HookupBridge.note("bridge: new session screen, connection kept, state re-requested")
             return true
         }
@@ -273,6 +279,26 @@ object DualSenseBridge {
                 })
             }
             workerHandler.postDelayed(this, TRITON_POLL_MS)
+        }
+    }
+
+    // ---------------- Steam Native Hook-up fast path ----------------
+    // The bridge gets the shared hook-up file itself (as a descriptor: Android lets an app use a descriptor it is
+    // handed, only opening another app's file by path is forbidden). It then writes each report straight into
+    // the file and wakes Steam's reader -- no message per report, no polling -- and DroidDeck only keeps the
+    // controller list and its sysfs description. An older bridge simply ignores the message.
+    @Volatile private var shmSentMs = 0L
+
+    private fun sendShm() {
+        val file = HookupBridge.shmFile ?: return
+        if (server == null) return
+        shmSentMs = android.os.SystemClock.uptimeMillis()
+        try {
+            android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_WRITE).use { pfd ->
+                send(Message.obtain(null, MSG_HOOKUP_SHM).apply { data = Bundle().apply { putParcelable("fd", pfd) } })
+            }
+        } catch (e: Exception) {
+            HookupBridge.note("hookup: could not hand the shared file to the bridge: $e")
         }
     }
 
