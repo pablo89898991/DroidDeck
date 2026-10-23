@@ -1408,8 +1408,15 @@ for name in os.listdir(ui):
         extra += open(os.path.join(ui, name), encoding="utf-8").read()
 needed = [
     "fun SettingsGroup(title: String",
-    "fun SettingsRow(label: String, hint: String?",
-    "options: List<Pair<T, String>>, selected: T, enabled: Boolean = true",
+    "fun SettingsRow(label: String, hint: String?, highlighted: Boolean = false, hintLines: Int? = null, stacked: Boolean = false",
+    "fun ValueChip(text: String, open: Boolean, enabled: Boolean = true, modifier: Modifier = Modifier, onClick: () -> Unit)",
+    "fun AnchoredMenu(",
+    "open: Boolean, onDismiss: () -> Unit, title: String? = null, note: String? = null,",
+    "content: @Composable ColumnScope.(FocusRequester) -> Unit,",
+    "fun MenuItem(",
+    "label: String, checked: Boolean, enabled: Boolean = true, detail: String? = null,",
+    "focusRequester: FocusRequester? = null, modifier: Modifier = Modifier, onClick: () -> Unit,",
+    "var open by mutableStateOf<String?>(null)",
     "fun ToggleRow(host: MenuHost, key: String, label: String, hint: String?, checked: Boolean, enabled: Boolean = true",
     "label: String, hint: String?, value: Int, range: IntRange, step: Int = 1, enabled: Boolean = true,",
     "format: (Int) -> String = { it.toString() }, modifier: Modifier = Modifier, onChange: (Int) -> Unit",
