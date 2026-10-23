@@ -21,7 +21,8 @@ static constexpr size_t HOOKUP_HEADER_SIZE = 4096;
 static constexpr size_t HOOKUP_SLOT_SIZE = 53248;
 static constexpr size_t HOOKUP_SIZE = HOOKUP_HEADER_SIZE + HOOKUP_SLOTS * HOOKUP_SLOT_SIZE;
 static constexpr int HOOKUP_FEATURE_TIMEOUT_MS = 1000;
-static constexpr int HOOKUP_OUTPUT_WAIT_MS = 50;
+static constexpr int HOOKUP_OUTPUT_WAIT_MS = 50;   // feature writes (settings): wait this long for room
+static constexpr int HOOKUP_REPORT_WAIT_MS = 4;    // output reports (rumble, lights): newer ones follow, so drop
 static constexpr int HOOKUP_FUTEX_WAIT = 0;  // FUTEX_WAIT, shared: the writer is the SDL3 bridge, another process
 
 struct HookupReport {
@@ -145,6 +146,77 @@ __attribute__((visibility("hidden"))) static void hookup_devpath(int i, const Ho
            s.vendor, s.product, 0x10 + i, HOOKUP_MINOR_BASE + i);
 }
 
+// ---- latency meter (logged to pad.log every 10 s while it has samples) ----
+// Where a button press of a hooked-up controller spends its time: from the moment its report is handed to Steam
+// to Steam's virtual pad (Steam's own processing), and from there to the game reading it. Mouse / keyboard
+// output from Steam does not go through the virtual pad, so it is not part of either number.
+struct HookupLatency {
+  std::mutex lock;
+  uint32_t n = 0;
+  uint64_t sum_us = 0, max_us = 0, since_us = 0;
+  void add(const char *what, uint64_t us, uint64_t now_us) {
+    std::lock_guard<std::mutex> guard(lock);
+    if (!since_us) since_us = now_us;
+    n++;
+    sum_us += us;
+    if (us > max_us) max_us = us;
+    if (now_us - since_us < 10000000ULL) return;
+    Logger::log("latency: %s: %u presses, avg %.1f ms, max %.1f ms\n", what, n, sum_us / 1000.0 / n, max_us / 1000.0);
+    n = 0;
+    sum_us = max_us = 0;
+    since_us = now_us;
+  }
+};
+static std::atomic<uint64_t> g_hookup_press_us{0};   // Steam process: a press handed to Steam, not yet on its pad
+
+/** Digital buttons of a Sony controller's USB input report (DualSense / Edge, DualShock 4); 0 = layout unknown. */
+__attribute__((visibility("hidden"))) static uint32_t hookup_buttons(const HookupSlot &s, const uint8_t *d, uint32_t n) {
+  if (s.vendor != 0x054c || n < 11 || d[0] != 0x01) return 0;
+  if (s.product == 0x0ce6 || s.product == 0x0df2)  // DualSense, DualSense Edge
+    return 0x80000000u | ((d[8] & 0x0f) != 8 ? 1u : 0u) | (d[8] & 0xf0u) | (uint32_t)d[9] << 8 | (uint32_t)(d[10] & 0xf7) << 16;
+  if (s.product == 0x05c4 || s.product == 0x09cc)  // DualShock 4
+    return 0x80000000u | ((d[5] & 0x0f) != 8 ? 1u : 0u) | (d[5] & 0xf0u) | (uint32_t)d[6] << 8 | (uint32_t)(d[7] & 0x03) << 16;
+  return 0;
+}
+
+/** Steam process, as Steam writes its virtual pad: a key press now = the press handed to Steam earlier. */
+__attribute__((visibility("hidden"))) static void hookup_meter_virtual_pad(const std::vector<struct input_event> &events) {
+  uint64_t press = g_hookup_press_us.load(std::memory_order_acquire);
+  if (!press) return;
+  uint64_t now = monotonic_us();
+  if (now - press > 1000000ULL) {  // never reached the pad (mapped to mouse / keyboard, or nothing)
+    g_hookup_press_us.compare_exchange_strong(press, 0);
+    return;
+  }
+  for (const struct input_event &ev : events) {
+    if (ev.type != EV_KEY || ev.value != 1) continue;
+    if (!g_hookup_press_us.compare_exchange_strong(press, 0)) return;
+    static HookupLatency stat;
+    stat.add("button press -> Steam's virtual pad", now - press, now);
+    return;
+  }
+}
+
+/** Game process, as it reads Steam's virtual pad: how long a key press waited there (stamped when Steam wrote it). */
+__attribute__((visibility("hidden"))) static void hookup_meter_game_read(const struct input_event *events, size_t count) {
+  if (process_is_steam_client()) return;
+  for (size_t i = 0; i < count; i++) {
+    if (events[i].type != EV_KEY || events[i].value != 1) continue;
+    struct timeval now = {};
+    gettimeofday(&now, nullptr);
+    int64_t us = (static_cast<int64_t>(now.tv_sec) - events[i].time.tv_sec) * 1000000LL + (now.tv_usec - events[i].time.tv_usec);
+    if (us < 0 || us > 1000000LL) continue;
+    static HookupLatency stat;
+    stat.add("Steam's virtual pad -> game read", static_cast<uint64_t>(us), monotonic_us());
+  }
+}
+
+/** Steam's output reports / feature writes to a hooked-up controller, logged every 10 s when Steam had to wait. */
+struct HookupOutputStat {
+  uint32_t reports = 0, features = 0, dropped = 0;
+  uint64_t waited_us = 0, since_us = 0;
+};
+
 __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *arg) {
   auto *holder = static_cast<std::shared_ptr<DeckHidraw> *>(arg);
   std::shared_ptr<DeckHidraw> self = *holder;
@@ -153,6 +225,7 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
   uint64_t next = s ? __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE) : 0;
   unsigned unread = 0;
   uint64_t meter_us = monotonic_us();
+  uint32_t buttons_was = 0;
   while (s && __atomic_load_n(&s->present, __ATOMIC_ACQUIRE) &&
          __atomic_load_n(&s->generation, __ATOMIC_ACQUIRE) == self->hookup_generation) {
     uint64_t written = __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE);
@@ -168,6 +241,12 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
       bool intact = __atomic_load_n(&r.seq, __ATOMIC_ACQUIRE) == next + 1;
       next++;
       if (!intact || !length) continue;
+      uint32_t buttons = hookup_buttons(*s, data, length);
+      if (buttons & ~buttons_was & 0x7fffffffu) {
+        uint64_t none = 0;
+        g_hookup_press_us.compare_exchange_strong(none, monotonic_us());
+      }
+      buttons_was = buttons;
       if (send(self->peer, data, length, MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
           failed = true;
@@ -239,7 +318,12 @@ __attribute__((visibility("hidden"))) static int open_hookup_hidraw(int flags, i
   return pair[0];
 }
 
-/** Steam -> controller: an output report (kind 0) or a feature-report write (kind 1). */
+/**
+ * Steam -> controller: an output report (kind 0) or a feature-report write (kind 1). Called without the hook's
+ * controller lock (see the write() patch), so a wait here never holds up Steam's other controller calls -- its
+ * virtual pad above all. Output reports (rumble, lights) wait at most a few ms for room: when the controller can't
+ * take them that fast the newest is dropped, as the next one carries the current state again.
+ */
 __attribute__((visibility("hidden"))) static void hookup_queue(const DeckHidraw &pad, const uint8_t *data, size_t size,
                                                                uint32_t kind) {
   HookupSlot *s = hookup_slot(pad.hookup);
@@ -247,10 +331,29 @@ __attribute__((visibility("hidden"))) static void hookup_queue(const DeckHidraw 
   if (size > HOOKUP_REPORT_MAX) size = HOOKUP_REPORT_MAX;
   static std::mutex one_at_a_time;
   std::lock_guard<std::mutex> guard(one_at_a_time);
+  static HookupOutputStat stats[HOOKUP_SLOTS];
+  HookupOutputStat &st = stats[pad.hookup];
+  uint64_t t0 = monotonic_us();
   uint64_t idx = __atomic_load_n(&s->out_write, __ATOMIC_RELAXED);
-  for (int waited = 0; idx - __atomic_load_n(&s->out_read, __ATOMIC_ACQUIRE) >= HOOKUP_OUT_FIFO &&
-                       waited < HOOKUP_OUTPUT_WAIT_MS * 4; waited++)
+  int limit = (kind ? HOOKUP_OUTPUT_WAIT_MS : HOOKUP_REPORT_WAIT_MS) * 4;
+  int waited = 0;
+  for (; idx - __atomic_load_n(&s->out_read, __ATOMIC_ACQUIRE) >= HOOKUP_OUT_FIFO && waited < limit; waited++)
     sleep_us(250);
+  uint64_t t1 = monotonic_us();
+  if (waited) st.waited_us += t1 - t0;
+  if (!st.since_us) st.since_us = t1;
+  if (kind) st.features++; else st.reports++;
+  bool full = idx - __atomic_load_n(&s->out_read, __ATOMIC_ACQUIRE) >= HOOKUP_OUT_FIFO;
+  if (full && !kind) st.dropped++;
+  if (t1 - st.since_us >= 10000000ULL) {
+    if (st.waited_us || st.dropped)
+      Logger::log("hookup: /dev/hidraw%u: Steam sent %u output reports + %u feature writes in 10 s; the controller "
+                  "fell behind: waited %.1f ms for room, dropped %u output reports\n",
+                  HOOKUP_MINOR_BASE + pad.hookup, st.reports, st.features, st.waited_us / 1000.0, st.dropped);
+    st = HookupOutputStat{};
+    st.since_us = t1;
+  }
+  if (full && !kind) return;
   HookupReport &r = s->out[idx % HOOKUP_OUT_FIFO];
   __atomic_store_n(&r.seq, 0, __ATOMIC_RELAXED);
   __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -275,6 +378,7 @@ __attribute__((visibility("hidden"))) static int hookup_get(const DeckHidraw &pa
   __atomic_store_n(&s->get_report_id, report_id | (input ? 0x100u : 0u), __ATOMIC_RELAXED);
   __atomic_store_n(&s->get_length, static_cast<int32_t>(std::min<size_t>(size, HOOKUP_REPORT_MAX)), __ATOMIC_RELAXED);
   uint64_t request = __atomic_add_fetch(&s->get_request, 1, __ATOMIC_RELEASE);
+  uint64_t t0 = monotonic_us();
   for (int waited = 0; waited < HOOKUP_FEATURE_TIMEOUT_MS * 4; waited++) {
     if (!__atomic_load_n(&s->present, __ATOMIC_ACQUIRE)) break;
     if (__atomic_load_n(&s->get_reply, __ATOMIC_ACQUIRE) == request) {
@@ -282,6 +386,13 @@ __attribute__((visibility("hidden"))) static int hookup_get(const DeckHidraw &pa
       if (length <= 0 || length > HOOKUP_REPORT_MAX) break;
       size_t copied = std::min(size, static_cast<size_t>(length));
       memcpy(buf, s->get, copied);
+      uint64_t took = monotonic_us() - t0;
+      static std::atomic<unsigned> slow;
+      if (took > 20000) {  // Steam waits for these: a slow one holds up that Steam thread
+        unsigned n = ++slow;
+        if ((n & (n - 1)) == 0)
+          Logger::log("hookup: report 0x%02x read took %.1f ms (slow reads so far: %u)\n", report_id, took / 1000.0, n);
+      }
       return static_cast<int>(copied);
     }
     sleep_us(250);

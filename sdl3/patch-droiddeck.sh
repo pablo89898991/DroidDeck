@@ -1031,13 +1031,35 @@ rep('  if (deck != deck_map().end()) {\n    if (deck->second->touch) return ioct
     '      return ioctl_hookup(*pad, op, argp);\n'
     '    }\n'
     '    if (deck->second->touch) return ioctl_touch(*deck->second, op, argp);')
-# write() / writev()
+# write() / writev(): a hooked-up controller's output goes to the shared file WITHOUT the hook's controller lock
+# held (writing may wait for room; with the lock held that wait would hold up Steam's virtual pad and reads)
 rep('    if (deck_map()[fd]->touch) touch_output(',
-    '    if (deck_map()[fd]->hookup >= 0) hookup_queue(*deck_map()[fd], static_cast<const uint8_t *>(buf), count, 0);\n'
-    '    else if (deck_map()[fd]->touch) touch_output(')
-rep('      if (device->touch) touch_output(',
-    '      if (device->hookup >= 0) hookup_queue(*device, static_cast<const uint8_t *>(iov[i].iov_base), iov[i].iov_len, 0);\n'
-    '      else if (device->touch) touch_output(')
+    '    if (deck_map()[fd]->hookup >= 0) {\n'
+    '      std::shared_ptr<DeckHidraw> pad = deck_map()[fd];\n'
+    '      guard.unlock();\n'
+    '      hookup_queue(*pad, static_cast<const uint8_t *>(buf), count, 0);\n'
+    '      return static_cast<ssize_t>(count);\n'
+    '    }\n'
+    '    if (deck_map()[fd]->touch) touch_output(')
+rep('    auto device = deck_map()[fd];\n    for (int i = 0; i < iovcnt; i++) {\n',
+    '    auto device = deck_map()[fd];\n'
+    '    if (device->hookup >= 0) {\n'
+    '      guard.unlock();\n'
+    '      for (int i = 0; i < iovcnt; i++) {\n'
+    '        hookup_queue(*device, static_cast<const uint8_t *>(iov[i].iov_base), iov[i].iov_len, 0);\n'
+    '        total += static_cast<ssize_t>(iov[i].iov_len);\n'
+    '      }\n'
+    '      return total;\n'
+    '    }\n'
+    '    for (int i = 0; i < iovcnt; i++) {\n')
+# latency meter: Steam writing its virtual pad, and a game reading it
+rep('__attribute__((visibility("hidden"))) static void flush_uinput(UinputWriter &w) {\n',
+    'static void hookup_meter_virtual_pad(const std::vector<struct input_event> &events);\n\n'
+    '__attribute__((visibility("hidden"))) static void flush_uinput(UinputWriter &w) {\n'
+    '  if (w.published) hookup_meter_virtual_pad(w.pending);\n')
+rep('          if (copied > 0) fake.read_seq += copied / sizeof(struct input_event);\n',
+    '          if (copied > 0) fake.read_seq += copied / sizeof(struct input_event);\n'
+    '          if (copied > 0 && fake.uinput) hookup_meter_game_read(input_events.data(), copied / sizeof(struct input_event));\n')
 # read() of Steam's uinput fd -> queued force-feedback requests
 rep('static ssize_t read_input(int fd, void *buf, size_t count) {\n  if (!watched(fd)) return syscall(SYS_read, fd, buf, count);\n',
     'static ssize_t read_input(int fd, void *buf, size_t count) {\n  if (!watched(fd)) return syscall(SYS_read, fd, buf, count);\n'
