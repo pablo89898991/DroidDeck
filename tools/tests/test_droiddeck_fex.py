@@ -691,6 +691,32 @@ class LaunchTest(FexTestCase):
             command, env, mode = G["launch"].call_args[0]
             self.assertEqual((command, mode), (["/game/run.sh", "-a"], "auto"))
 
+    def test_steam_games_get_their_settings_and_linux_unity_keeps_tso(self):
+        config = self.home / ".config/droiddeck/game-environment.json"
+        unity = self.write(self.tmp / "Megabonk/Megabonk.x86_64", elf(62), 0o755)
+        self.write(self.tmp / "Megabonk/UnityPlayer.so", elf(62))
+        self.write(self.tmp / "Megabonk/GameAssembly.so", elf(62))
+        other = self.write(self.tmp / "Other/game.x86_64", elf(62), 0o755)
+        self.write(config, json.dumps({"version": 1, "shared": {"FEX_TSOENABLED": "0", "FEX_MULTIBLOCK": "1"},
+                                       "games": {"20": {"FEX_TSOENABLED": "0"}}}))
+
+        def started(program, app):
+            with mock.patch.dict(G, {"launch": mock.Mock(return_value=0), "GAME_ENVIRONMENT": str(config)}), \
+                    mock.patch.dict(os.environ, {"SteamAppId": app}, clear=True):
+                _, said = self.quiet(FEX["main"], ["steam", "waitforexitandrun", str(program), "-arg"])
+                command, env, _ = G["launch"].call_args[0]
+            self.assertEqual(command, [str(program), "-arg"])
+            return env.get("FEX_TSOENABLED"), env.get("FEX_MULTIBLOCK"), said
+
+        tso, multiblock, said = started(unity, "10")
+        self.assertEqual((tso, multiblock), ("1", "1"))
+        self.assertIn("Unity: FEX with TSO", said)
+        self.assertEqual(started(other, "10")[:2], ("0", "1"))
+        self.assertEqual(started(unity, "20")[:2], ("0", "1"))
+        config.unlink()
+        self.assertEqual(started(unity, "10")[:2], ("1", None))
+        self.assertEqual(started(other, "10")[:2], (None, None))
+
 
 class AppInfoTest(unittest.TestCase):
     COMPAT = runpy.run_path(str(BIN / "steam-compatibility"))

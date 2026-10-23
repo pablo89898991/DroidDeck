@@ -69,7 +69,7 @@ MARK="<!-- droiddeck-pr-build -->"
   echo
 } > /tmp/pr-report.md
 cat /tmp/pr-report.md >> "$GITHUB_STEP_SUMMARY"
-ID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate --jq ".[] | select(.body | startswith(\"$MARK\")) | .id" | head -1 || true)
+ID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARK\"))) | .id" | head -1 || true)
 if [ -n "$ID" ]; then
   gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${ID}" -F body=@/tmp/pr-report.md >/dev/null
 else

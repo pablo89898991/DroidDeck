@@ -50,9 +50,9 @@ object SessionPrefs {
     )
 
     fun orientation(context: Context): Int =
-        prefs(context).getInt("orientation", ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+        prefs(context).getInt("orientation", ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
             .takeIf { value -> orientationOptions.any { it.first == value } }
-            ?: ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            ?: ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 
     fun setOrientation(context: Context, orientation: Int) {
         require(orientationOptions.any { it.first == orientation })
@@ -500,8 +500,8 @@ object SessionPrefs {
         prefs(context).edit().putBoolean("prootFastPath", on).apply()
     }
 
-    /** gamescope draws the cursor itself. Off by default: on a phone that plane costs frames. */
-    fun cursorComposite(context: Context): Boolean = prefs(context).getBoolean("cursorComposite", false)
+    /** gamescope draws the cursor itself. SDL3Deck: on by default, for controller-driven mouse (Steam Input). */
+    fun cursorComposite(context: Context): Boolean = prefs(context).getBoolean("cursorComposite", true)
 
     fun setCursorComposite(context: Context, on: Boolean) {
         prefs(context).edit().putBoolean("cursorComposite", on).apply()
