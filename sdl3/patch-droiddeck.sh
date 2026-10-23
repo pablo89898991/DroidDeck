@@ -1450,5 +1450,53 @@ else
   warn "SdlBridgeSettings.kt or DroidDeck's settings screen not found (skipping the SDL3Bridge tab)"
 fi
 
+# ---------- 23. The same SDL3Bridge page in the in-session drawer ----------
+# The session drawer (Controller / Display / Effects / VR / Game profile / Session) gets an SDL3Bridge page too,
+# so the bridge can be changed while playing. Its controls get the drawer's focus tracking (controller navigation).
+# All or nothing: if one of DroidDeck's files no longer matches, none of them is changed.
+SDP="$UI/SessionDrawerPage.kt"
+SOV="$UI/SessionOverlay.kt"
+STR="$DD/app/src/main/res/values/strings.xml"
+if [ -f "$UI/SdlBridgeSettings.kt" ] && [ -f "$SDP" ] && [ -f "$SOV" ] && [ -f "$STR" ]; then
+  if python3 - "$SDP" "$SOV" "$STR" <<'PY'
+import sys
+paths = sys.argv[1:4]
+texts = {p: open(p, encoding="utf-8").read() for p in paths}
+sdp, sov, strs = paths
+MARK = "SDL3BRIDGE("
+if MARK in texts[sdp]:
+    print("already"); sys.exit(0)
+edits = {
+    sdp: [('    SESSION("suspend"),\n', '    SDL3BRIDGE("sdl3-open"),   // sdl3bridge: SDL3Bridge page\n    SESSION("suspend"),\n')],
+    sov: [
+        ('import androidx.compose.material.icons.outlined.SportsEsports\n',
+         'import androidx.compose.material.icons.outlined.SportsEsports\nimport androidx.compose.material.icons.outlined.Usb\n'),
+        ('    SessionDrawerPage.SESSION -> R.string.mode_session\n',
+         '    SessionDrawerPage.SDL3BRIDGE -> R.string.drawer_page_sdl3bridge\n    SessionDrawerPage.SESSION -> R.string.mode_session\n'),
+        ('    SessionDrawerPage.SESSION -> Icons.Outlined.Settings\n',
+         '    SessionDrawerPage.SDL3BRIDGE -> Icons.Outlined.Usb\n    SessionDrawerPage.SESSION -> Icons.Outlined.Settings\n'),
+        ('                        SessionDrawerPage.SESSION -> {\n',
+         '                        SessionDrawerPage.SDL3BRIDGE -> SdlBridgeSettingsTab(host) { key -> focus.track(page, key) }\n'
+         '                        SessionDrawerPage.SESSION -> {\n'),
+    ],
+    strs: [('</resources>', '    <string name="drawer_page_sdl3bridge">SDL3Bridge</string>\n</resources>')],
+}
+for path, changes in edits.items():
+    for old, new in changes:
+        if texts[path].count(old) != 1:
+            sys.stderr.write("ANCHOR-MISS drawer page :: %s :: %r (found %d)\n" % (path.rsplit("/", 1)[-1], old[:60], texts[path].count(old)))
+            sys.exit(3)
+        texts[path] = texts[path].replace(old, new, 1)
+for path in paths:
+    open(path, "w", encoding="utf-8").write(texts[path])
+print("OK")
+PY
+  then ok "session drawer: SDL3Bridge page"
+  else warn "SDL3Bridge page left out of the session drawer (DroidDeck's drawer changed; see the line above)"
+  fi
+else
+  warn "session drawer files or the SDL3Bridge tab not found (skipping the drawer page)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
