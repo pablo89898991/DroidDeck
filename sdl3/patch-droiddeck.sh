@@ -1659,5 +1659,38 @@ PY
   esac
 fi
 
+# ---------- 27. Controller-driven mouse works out of the box ("Draw the cursor inside gamescope" on) ----------
+# Upstream made Performance -> Session fixes -> "Draw the cursor inside gamescope" opt-in (off saves a plane on
+# the phone's compositor). With it off, Steam Input's mouse output from a controller doesn't work properly: a
+# button bound to a mouse click did nothing (keyboard bindings and mouse movement still did). This fork is about
+# controllers, so it starts ON here; the switch stays, and turning it off still works.
+CPREFS="$PKG/session/SessionPrefs.kt"
+if [ -f "$CPREFS" ]; then
+  res=$(python3 - "$CPREFS" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path, encoding='utf-8').read()
+new = 'fun cursorComposite(context: Context): Boolean = prefs(context).getBoolean("cursorComposite", true)'
+if new in s:
+    print("SKIP")
+    sys.exit(0)
+old = 'fun cursorComposite(context: Context): Boolean = prefs(context).getBoolean("cursorComposite", false)'
+if s.count(old) != 1:
+    sys.stderr.write("ANCHOR-MISS SessionPrefs.cursorComposite :: %r\n" % old[:70])
+    sys.exit(3)
+s = s.replace(old, new)
+s = s.replace('/** gamescope draws the cursor itself. Off by default: on a phone that plane costs frames. */',
+              '/** gamescope draws the cursor itself. SDL3Deck: on by default, for controller-driven mouse (Steam Input). */')
+open(path, 'w', encoding='utf-8').write(s)
+print("OK")
+PY
+)
+  case "$res" in
+    OK) ok "\"Draw the cursor inside gamescope\" on by default (controller mouse clicks work)" ;;
+    SKIP) skip "cursor inside gamescope on by default" ;;
+    *) warn "cursor default left as upstream (SessionPrefs changed, see ANCHOR-MISS above): turn on Performance -> Draw the cursor inside gamescope" ;;
+  esac
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
