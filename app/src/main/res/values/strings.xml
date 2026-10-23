@@ -3048,4 +3048,5 @@
     <string name="spatial_opencv_load_error">OpenCV could not load</string>
     <string name="drawer_game_thread_hints">Game thread boost</string>
     <string name="drawer_game_thread_hints_hint">Moves the busiest game threads to the fastest CPU cores (Android performance hints). Turn off if a game paces worse.</string>
+    <string name="drawer_page_sdl3bridge">SDL3Bridge</string>
 </resources>

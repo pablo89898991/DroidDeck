@@ -137,8 +137,12 @@ internal object SdlBridgeLink {
     }
 }
 
+/**
+ * The SDL3Bridge settings page: a tab of DroidDeck's Setup screen, and a page of the in-session drawer.
+ * [track] gives each control the drawer's focus tracking (controller navigation); Setup passes nothing.
+ */
 @Composable
-internal fun SdlBridgeSettingsTab(host: MenuHost) {
+internal fun SdlBridgeSettingsTab(host: MenuHost, track: (String) -> Modifier = { Modifier }) {
     val ctx = LocalContext.current
     val installed = remember { SdlBridgeLink.installed(ctx) }
     if (!installed) {
@@ -198,7 +202,7 @@ internal fun SdlBridgeSettingsTab(host: MenuHost) {
             if (!any) SettingsRow("No controller", "Plug a controller in with USB-C, or pair it over Bluetooth.") {}
         }
         ActionRow("Open SDL3Bridge", "Controller test screen, USB access, USB audio and everything else.", "Open",
-            onClick = { SdlBridgeLink.open(ctx) })
+            onClick = { SdlBridgeLink.open(ctx) }, modifier = track("sdl3-open"))
     }
     if (s == null) return
 
@@ -211,48 +215,48 @@ internal fun SdlBridgeSettingsTab(host: MenuHost) {
     SettingsGroup("Controller mode") {
         ChoiceRow(host, "sdl3-present", "Present controller as",
             "How Steam sees the controller. Steam Native Hook-up hands USB controllers to Steam as themselves, like on a PC.",
-            indexed("presentNames"), s.getInt("presentAs")) { SdlBridgeLink.set("presentAs", int = it) }
+            indexed("presentNames"), s.getInt("presentAs"), chipModifier = track("sdl3-present")) { SdlBridgeLink.set("presentAs", int = it) }
         ToggleRow(host, "sdl3-driver", "SDL3 driver",
             "On: SDL3 reads the controller (all its features). Off: the controller goes back to Android and DroidDeck.",
-            s.getBoolean("driverEnabled")) { SdlBridgeLink.set("driverEnabled", bool = it) }
+            s.getBoolean("driverEnabled"), chipModifier = track("sdl3-driver")) { SdlBridgeLink.set("driverEnabled", bool = it) }
         ChoiceRow(host, "sdl3-source", "Controller source", "Which controllers SDL3 uses.",
-            listOf(false to "Auto: USB and Bluetooth", true to "Forced: USB only"), s.getBoolean("forceUsb")) {
+            listOf(false to "Auto: USB and Bluetooth", true to "Forced: USB only"), s.getBoolean("forceUsb"), chipModifier = track("sdl3-source")) {
             SdlBridgeLink.set("forceUsb", bool = it)
         }
         val rateMs = ints("rateMs")
         ChoiceRow(host, "sdl3-rate", "Poll rate", "Higher = lower gyro and trackpad latency, a little more battery.",
-            names("rateNames").mapIndexed { i, n -> rateMs.getOrElse(i) { 2 } to n }, s.getInt("pollMs")) {
+            names("rateNames").mapIndexed { i, n -> rateMs.getOrElse(i) { 2 } to n }, s.getInt("pollMs"), chipModifier = track("sdl3-rate")) {
             SdlBridgeLink.set("pollMs", int = it)
         }
         val overlay = s.getBoolean("overlayAllowed")
         ToggleRow(host, "sdl3-bubble", "Floating bubble",
             if (overlay) "Tap: SDL3 driver on/off. Double tap: Steam Native Hook-up. Hold 3 s: open SDL3Bridge."
             else "Needs SDL3Bridge's \"Draw over other apps\" permission: turn the bubble on once in SDL3Bridge.",
-            s.getBoolean("bubble"), enabled = overlay || s.getBoolean("bubble")) { SdlBridgeLink.set("bubble", bool = it) }
+            s.getBoolean("bubble"), enabled = overlay || s.getBoolean("bubble"), chipModifier = track("sdl3-bubble")) { SdlBridgeLink.set("bubble", bool = it) }
     }
 
     // ---------------- per player ----------------
     var player by rememberSaveable { mutableIntStateOf(0) }
     val p = player
     Box(Modifier.fillMaxWidth().padding(top = 16.dp)) {
-        SegmentedTabs((0 until 4).map { it to "P${it + 1}" }, player) { player = it }
+        SegmentedTabs((0 until 4).map { it to "P${it + 1}" }, player, tabModifier = { track("sdl3-player-$it") }) { player = it }
     }
 
     SettingsGroup("Gyro · player ${p + 1}") {
         SliderRow("Gyro speed", "100 % = 1:1", ints("gyroGain").getOrElse(p) { 100 }, 5..800, step = 5,
-            format = { "$it %" }) { SdlBridgeLink.set("gyroGain", p, int = it) }
+            format = { "$it %" }, modifier = track("sdl3-gyrospeed-$p")) { SdlBridgeLink.set("gyroGain", p, int = it) }
         ChoiceRow(host, "sdl3-gyroinv-$p", "Invert gyro axes", null, indexed("gyroInvNames"),
-            ints("gyroInvert").getOrElse(p) { 0 }) { SdlBridgeLink.set("gyroInvert", p, int = it) }
+            ints("gyroInvert").getOrElse(p) { 0 }, chipModifier = track("sdl3-gyroinv-$p")) { SdlBridgeLink.set("gyroInvert", p, int = it) }
         for (i in 0 until 3) {
             ChoiceRow(host, "sdl3-gyromap-$p-$i", "DroidDeck gyro ${"XYZ"[i]} comes from", null, indexed("axisNames"),
-                ints("gyroMap").getOrElse(p * 3 + i) { i }) { SdlBridgeLink.set("gyroMap", p, i, int = it) }
+                ints("gyroMap").getOrElse(p * 3 + i) { i }, chipModifier = track("sdl3-gyromap-$p-$i")) { SdlBridgeLink.set("gyroMap", p, i, int = it) }
         }
         ToggleRow(host, "sdl3-accel-$p", "Accelerometer follows the axis remap",
-            "Keeps gravity consistent with rotation.", bools("accelFollows").getOrElse(p) { true }) {
+            "Keeps gravity consistent with rotation.", bools("accelFollows").getOrElse(p) { true }, chipModifier = track("sdl3-accel-$p")) {
             SdlBridgeLink.set("accelFollows", p, bool = it)
         }
         SliderRow("Gyro deadzone", "Motion slower than this is ignored, so the view doesn't drift while you hold still.",
-            ints("gyroDeadzone").getOrElse(p) { 0 }, 0..50, format = { "$it °/s" }) { SdlBridgeLink.set("gyroDeadzone", p, int = it) }
+            ints("gyroDeadzone").getOrElse(p) { 0 }, 0..50, format = { "$it °/s" }, modifier = track("sdl3-gyrodeadzone-$p")) { SdlBridgeLink.set("gyroDeadzone", p, int = it) }
         val bias = s.getFloatArray("gyroBias") ?: FloatArray(0)
         val calibrating = s.getInt("calibrating", -1) == p
         val b = (0 until 3).map { bias.getOrElse(p * 3 + it) { 0f } }
@@ -261,18 +265,20 @@ internal fun SdlBridgeSettingsTab(host: MenuHost) {
                 calibrating -> "Hold player ${p + 1}'s controller flat and still…"
                 b.all { it == 0f } -> "Lay the controller flat and still, then tap. Not calibrated yet."
                 else -> "Drift removed: x %.2f, y %.2f, z %.2f °/s".format(b[0], b[1], b[2])
-            }, "Calibrate", onClick = { SdlBridgeLink.set("calibrate", p) })
-        ActionRow("Reset calibration", null, "Reset", onClick = { SdlBridgeLink.set("resetCalibration", p) })
+            }, "Calibrate", onClick = { SdlBridgeLink.set("calibrate", p) },
+            modifier = track("sdl3-calibrate-$p"))
+        ActionRow("Reset calibration", null, "Reset", onClick = { SdlBridgeLink.set("resetCalibration", p) },
+            modifier = track("sdl3-uncalibrate-$p"))
     }
 
     SettingsGroup("Touchpad · player ${p + 1}") {
         ChoiceRow(host, "sdl3-touch-$p", "Layout", "Split: left half = left trackpad, right half = right trackpad.",
-            names("touchNames").mapIndexed { i, n -> i to n.substringBefore(":") }, ints("touchMode").getOrElse(p) { 0 }) {
+            names("touchNames").mapIndexed { i, n -> i to n.substringBefore(":") }, ints("touchMode").getOrElse(p) { 0 }, chipModifier = track("sdl3-touch-$p")) {
             SdlBridgeLink.set("touchMode", p, int = it)
         }
-        ToggleRow(host, "sdl3-tinvx-$p", "Invert X", null, bools("touchInvX").getOrElse(p) { false }) { SdlBridgeLink.set("touchInvX", p, bool = it) }
-        ToggleRow(host, "sdl3-tinvy-$p", "Invert Y", null, bools("touchInvY").getOrElse(p) { false }) { SdlBridgeLink.set("touchInvY", p, bool = it) }
-        ToggleRow(host, "sdl3-tswap-$p", "Swap X and Y", "Applied before inverting.", bools("touchSwap").getOrElse(p) { false }) {
+        ToggleRow(host, "sdl3-tinvx-$p", "Invert X", null, bools("touchInvX").getOrElse(p) { false }, chipModifier = track("sdl3-tinvx-$p")) { SdlBridgeLink.set("touchInvX", p, bool = it) }
+        ToggleRow(host, "sdl3-tinvy-$p", "Invert Y", null, bools("touchInvY").getOrElse(p) { false }, chipModifier = track("sdl3-tinvy-$p")) { SdlBridgeLink.set("touchInvY", p, bool = it) }
+        ToggleRow(host, "sdl3-tswap-$p", "Swap X and Y", "Applied before inverting.", bools("touchSwap").getOrElse(p) { false }, chipModifier = track("sdl3-tswap-$p")) {
             SdlBridgeLink.set("touchSwap", p, bool = it)
         }
     }
@@ -282,20 +288,20 @@ internal fun SdlBridgeSettingsTab(host: MenuHost) {
         val remap = ints("remap")
         val sources = indexed("srcNames")
         targets.forEachIndexed { i, target ->
-            ChoiceRow(host, "sdl3-remap-$p-$i", target, "Pressed by", sources, remap.getOrElse(p * targets.size + i) { 0 }) {
+            ChoiceRow(host, "sdl3-remap-$p-$i", target, "Pressed by", sources, remap.getOrElse(p * targets.size + i) { 0 }, chipModifier = track("sdl3-remap-$p-$i")) {
                 SdlBridgeLink.set("remap", p, i, int = it)
             }
         }
     }
 
     SettingsGroup("Lightbar · player ${p + 1}") {
-        SliderRow("Red", null, ints("lightR").getOrElse(p) { 0 }, 0..255) { SdlBridgeLink.set("lightR", p, int = it) }
-        SliderRow("Green", null, ints("lightG").getOrElse(p) { 0 }, 0..255) { SdlBridgeLink.set("lightG", p, int = it) }
-        SliderRow("Blue", null, ints("lightB").getOrElse(p) { 255 }, 0..255) { SdlBridgeLink.set("lightB", p, int = it) }
-        SliderRow("Brightness", null, ints("brightness").getOrElse(p) { 100 }, 0..100, format = { "$it %" }) {
+        SliderRow("Red", null, ints("lightR").getOrElse(p) { 0 }, 0..255, modifier = track("sdl3-red-$p")) { SdlBridgeLink.set("lightR", p, int = it) }
+        SliderRow("Green", null, ints("lightG").getOrElse(p) { 0 }, 0..255, modifier = track("sdl3-green-$p")) { SdlBridgeLink.set("lightG", p, int = it) }
+        SliderRow("Blue", null, ints("lightB").getOrElse(p) { 255 }, 0..255, modifier = track("sdl3-blue-$p")) { SdlBridgeLink.set("lightB", p, int = it) }
+        SliderRow("Brightness", null, ints("brightness").getOrElse(p) { 100 }, 0..100, format = { "$it %" }, modifier = track("sdl3-brightness-$p")) {
             SdlBridgeLink.set("brightness", p, int = it)
         }
-        ChoiceRow(host, "sdl3-pled-$p", "Player LEDs", null, indexed("playerLedNames"), ints("playerLed").getOrElse(p) { 0 }) {
+        ChoiceRow(host, "sdl3-pled-$p", "Player LEDs", null, indexed("playerLedNames"), ints("playerLed").getOrElse(p) { 0 }, chipModifier = track("sdl3-pled-$p")) {
             SdlBridgeLink.set("playerLed", p, int = it)
         }
     }
