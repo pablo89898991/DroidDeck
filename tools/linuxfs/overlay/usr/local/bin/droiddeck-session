@@ -831,6 +831,11 @@ BUSCONF
     steam_channel=steamdeck_publicbeta
     _bl_lang=()
     [ -n "${BL_STEAM_LANGUAGE:-}" ] && _bl_lang=(-language "$BL_STEAM_LANGUAGE")
+    # sdl3bridge: controller_rate: how often Steam Input updates the game's virtual controller, in microseconds
+    # (Steam's default 2000 = 500 Hz). Override in ~/.config/droiddeck/controller-rate (0 = no limit).
+    _bl_rate=$(cat "$HOME/.config/droiddeck/controller-rate" 2>/dev/null)
+    case $_bl_rate in ''|*[!0-9]*) _bl_rate=500 ;; esac
+    _bl_input=(+controller_rate "$_bl_rate")
     steam_beta=$steam_root/package/beta
     if [ -n "${BL_ADDED_GAMES:-}" ] && [ -f "$BL_ADDED_GAMES" ]; then
       if [ "$steam_x64" = 0 ]; then
@@ -842,7 +847,7 @@ BUSCONF
       fi
       games_watcher=$!
     fi
-    echo "== steam args: ${_bl_ui[*]} ${_bl_cdp[*]} ${_bl_lang[*]} -clientbeta $steam_channel -no-cef-sandbox -cef-ozone-platform=x11 ${_bl_cef[*]} $*$([ "$steam_x64" = 1 ] && echo ' (x86-64 client under FEX)')"
+    echo "== steam args: ${_bl_ui[*]} ${_bl_cdp[*]} ${_bl_lang[*]} ${_bl_input[*]} -clientbeta $steam_channel -no-cef-sandbox -cef-ozone-platform=x11 ${_bl_cef[*]} $*$([ "$steam_x64" = 1 ] && echo ' (x86-64 client under FEX)')"
     steam_updates=0
     rm -f "$HOME/.bl-stop-requested" "$STEAMOS_STEAM_SHUTDOWN_SENTINEL" "$STEAMOS_STEAM_REBOOT_SENTINEL"
     steam_other_game_running() {
@@ -1155,7 +1160,7 @@ BUSCONF
         desktop_ui_pid=$!
       fi
       steam_started=$SECONDS
-      "${steam_client[@]}" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
+      "${steam_client[@]}" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" "${_bl_input[@]}" -clientbeta "$steam_channel" \
         -no-cef-sandbox -cef-ozone-platform=x11 "${_bl_cef[@]}" "$@"
       rc=$?
       steam_ran=$((SECONDS - steam_started))
