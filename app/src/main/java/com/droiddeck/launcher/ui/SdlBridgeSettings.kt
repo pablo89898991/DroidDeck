@@ -12,6 +12,8 @@ import android.os.Message
 import android.os.Messenger
 import android.os.RemoteException
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
@@ -25,6 +27,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 
@@ -219,18 +222,18 @@ internal fun SdlBridgeSettingsTab(host: MenuHost, track: (String) -> Modifier = 
 
     // ---------------- global ----------------
     SettingsGroup("Controller mode") {
-        ChoiceRow(host, "sdl3-present", "Present controller as",
+        BridgeChoiceRow(host, "sdl3-present", "Present controller as",
             "How Steam sees the controller. Steam Native Hook-up hands USB controllers to Steam as themselves, like on a PC.",
             indexed("presentNames"), s.getInt("presentAs"), chipModifier = track("sdl3-present")) { SdlBridgeLink.set("presentAs", int = it) }
         ToggleRow(host, "sdl3-driver", "SDL3 driver",
             "On: SDL3 reads the controller (all its features). Off: the controller goes back to Android and DroidDeck.",
             s.getBoolean("driverEnabled"), chipModifier = track("sdl3-driver")) { SdlBridgeLink.set("driverEnabled", bool = it) }
-        ChoiceRow(host, "sdl3-source", "Controller source", "Which controllers SDL3 uses.",
-            listOf(false to "Auto: USB and Bluetooth", true to "Forced: USB only"), s.getBoolean("forceUsb"), chipModifier = track("sdl3-source")) {
+        BridgeChoiceRow(host, "sdl3-source", "Controller source", "Which controllers SDL3 uses.",
+            listOf(false to "USB + Bluetooth (auto)", true to "USB only (forced)"), s.getBoolean("forceUsb"), chipModifier = track("sdl3-source")) {
             SdlBridgeLink.set("forceUsb", bool = it)
         }
         val rateMs = ints("rateMs")
-        ChoiceRow(host, "sdl3-rate", "Poll rate", "Higher = lower gyro and trackpad latency, a little more battery.",
+        BridgeChoiceRow(host, "sdl3-rate", "Poll rate", "Higher = lower gyro and trackpad latency, a little more battery.",
             names("rateNames").mapIndexed { i, n -> rateMs.getOrElse(i) { 2 } to n }, s.getInt("pollMs"), chipModifier = track("sdl3-rate")) {
             SdlBridgeLink.set("pollMs", int = it)
         }
@@ -251,10 +254,10 @@ internal fun SdlBridgeSettingsTab(host: MenuHost, track: (String) -> Modifier = 
     SettingsGroup("Gyro · player ${p + 1}") {
         SliderRow("Gyro speed", "100 % = 1:1", ints("gyroGain").getOrElse(p) { 100 }, 5..800, step = 5,
             format = { "$it %" }, modifier = track("sdl3-gyrospeed-$p")) { SdlBridgeLink.set("gyroGain", p, int = it) }
-        ChoiceRow(host, "sdl3-gyroinv-$p", "Invert gyro axes", null, indexed("gyroInvNames"),
+        BridgeChoiceRow(host, "sdl3-gyroinv-$p", "Invert gyro axes", null, indexed("gyroInvNames"),
             ints("gyroInvert").getOrElse(p) { 0 }, chipModifier = track("sdl3-gyroinv-$p")) { SdlBridgeLink.set("gyroInvert", p, int = it) }
         for (i in 0 until 3) {
-            ChoiceRow(host, "sdl3-gyromap-$p-$i", "DroidDeck gyro ${"XYZ"[i]} comes from", null, indexed("axisNames"),
+            BridgeChoiceRow(host, "sdl3-gyromap-$p-$i", "DroidDeck gyro ${"XYZ"[i]} comes from", null, indexed("axisNames"),
                 ints("gyroMap").getOrElse(p * 3 + i) { i }, chipModifier = track("sdl3-gyromap-$p-$i")) { SdlBridgeLink.set("gyroMap", p, i, int = it) }
         }
         ToggleRow(host, "sdl3-accel-$p", "Accelerometer follows the axis remap",
@@ -278,8 +281,8 @@ internal fun SdlBridgeSettingsTab(host: MenuHost, track: (String) -> Modifier = 
     }
 
     SettingsGroup("Touchpad · player ${p + 1}") {
-        ChoiceRow(host, "sdl3-touch-$p", "Layout", "Split: left half = left trackpad, right half = right trackpad.",
-            names("touchNames").mapIndexed { i, n -> i to n.substringBefore(":") }, ints("touchMode").getOrElse(p) { 0 }, chipModifier = track("sdl3-touch-$p")) {
+        BridgeChoiceRow(host, "sdl3-touch-$p", "Layout", "How the controller's touchpad maps to the Deck's two trackpads.",
+            indexed("touchNames"), ints("touchMode").getOrElse(p) { 0 }, chipModifier = track("sdl3-touch-$p")) {
             SdlBridgeLink.set("touchMode", p, int = it)
         }
         ToggleRow(host, "sdl3-tinvx-$p", "Invert X", null, bools("touchInvX").getOrElse(p) { false }, chipModifier = track("sdl3-tinvx-$p")) { SdlBridgeLink.set("touchInvX", p, bool = it) }
@@ -294,7 +297,7 @@ internal fun SdlBridgeSettingsTab(host: MenuHost, track: (String) -> Modifier = 
         val remap = ints("remap")
         val sources = indexed("srcNames")
         targets.forEachIndexed { i, target ->
-            ChoiceRow(host, "sdl3-remap-$p-$i", target, "Pressed by", sources, remap.getOrElse(p * targets.size + i) { 0 }, chipModifier = track("sdl3-remap-$p-$i")) {
+            BridgeChoiceRow(host, "sdl3-remap-$p-$i", target, "Pressed by", sources, remap.getOrElse(p * targets.size + i) { 0 }, chipModifier = track("sdl3-remap-$p-$i")) {
                 SdlBridgeLink.set("remap", p, i, int = it)
             }
         }
@@ -307,8 +310,56 @@ internal fun SdlBridgeSettingsTab(host: MenuHost, track: (String) -> Modifier = 
         SliderRow("Brightness", null, ints("brightness").getOrElse(p) { 100 }, 0..100, format = { "$it %" }, modifier = track("sdl3-brightness-$p")) {
             SdlBridgeLink.set("brightness", p, int = it)
         }
-        ChoiceRow(host, "sdl3-pled-$p", "Player LEDs", null, indexed("playerLedNames"), ints("playerLed").getOrElse(p) { 0 }, chipModifier = track("sdl3-pled-$p")) {
+        BridgeChoiceRow(host, "sdl3-pled-$p", "Player LEDs", null, indexed("playerLedNames"), ints("playerLed").getOrElse(p) { 0 }, chipModifier = track("sdl3-pled-$p")) {
             SdlBridgeLink.set("playerLed", p, int = it)
+        }
+    }
+}
+
+/** "Steam Native Hook-up (Steam sees the real controller)" -> "Steam Native Hook-up" + "Steam sees the real controller";
+ *  "Split (decoupled): left half = ..." -> "Split (decoupled)" + "left half = ...". */
+private fun splitName(name: String): Pair<String, String?> {
+    val colon = name.indexOf(": ")
+    if (colon > 0) return name.substring(0, colon) to name.substring(colon + 2)
+    val paren = name.indexOf(" (")
+    if (paren > 0 && name.endsWith(")")) return name.substring(0, paren) to name.substring(paren + 2, name.length - 1)
+    return name to null
+}
+
+/**
+ * DroidDeck's ChoiceRow, for the bridge's (long) names. The chip shows the short name and the menu the short name
+ * with the rest under it. When the chip would squeeze the label -- the session drawer is narrow, and a long chip
+ * left the label no width at all, so the rows looked empty -- the chip goes under the label instead of beside it.
+ */
+@Composable
+private fun <T> BridgeChoiceRow(
+    host: MenuHost, key: String, label: String, hint: String?,
+    options: List<Pair<T, String>>, selected: T, chipModifier: Modifier = Modifier,
+    onPick: (T) -> Unit,
+) {
+    val open = host.open == key
+    val parts = remember(options) { options.map { (value, name) -> splitName(name).let { Triple(value, it.first, it.second) } } }
+    val chip = parts.firstOrNull { it.first == selected }?.second ?: "-"
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        // ~7 dp per character of the chip's 13 sp text, plus its padding and caret; beside the label only while
+        // the label keeps at least half of the row
+        val chipWidth = (parts.maxOfOrNull { it.second.length } ?: 0) * 7f + 40f
+        val stacked = chipWidth > maxWidth.value * 0.5f
+        Column(Modifier.fillMaxWidth()) {
+            SettingsRow(label, hint, highlighted = open, stacked = stacked) {
+                Box {
+                    ValueChip(chip, open, modifier = chipModifier.testTag("setting-$key")) { host.open = if (open) null else key }
+                    AnchoredMenu(open, onDismiss = { if (host.open == key) host.open = null }, title = label) { firstItemFocus ->
+                        parts.forEachIndexed { index, (value, text, detail) ->
+                            MenuItem(text, checked = value == selected, detail = detail,
+                                focusRequester = if (index == 0) firstItemFocus else null) {
+                                onPick(value)
+                                host.open = null
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
