@@ -4093,15 +4093,15 @@ __attribute__((constructor)) static void start_hookup_watch() {
   if (pthread_create(&thread, nullptr, hookup_watch_thread, nullptr) == 0) pthread_detach(thread);
 }
 // ---- Steam Input's mouse / keyboard output, traced (pad.log "mouse: ...") ----
-// A Steam binding to a key, mouse movement or a mouse button reaches a game in three steps, in three processes:
-//   1. Steam sends an XTest event to its X server (Xwayland),
-//   2. Xwayland hands it to gamescope (libei: Xwayland's XTest goes to the compositor),
-//   3. gamescope receives it (libeis) and delivers it to the game's window.
-// This library is loaded in all of them, so each step is logged: a click that goes missing shows where. Buttons
-// are logged one by one at first (then every 100th), keys a few times to compare; motion is only counted.
-// Every call is passed on unchanged.
+// A Steam binding to a key, mouse movement or a mouse button reaches a game in three steps: Steam sends an XTest
+// event to the game's X server (Xwayland; Steam does send clicks there), Xwayland hands it to gamescope over libei,
+// and gamescope (libeis) delivers it to the game's window. Steps 2 and 3 are logged here, in the Xwayland and
+// gamescope processes (this library is loaded in all of them), plus the input device each side sets up -- so a
+// click that goes missing shows where. Buttons are logged one by one at first (then every 100th), keys a few times
+// to compare. Every call is passed on unchanged. The real function is looked up in the library itself if it is not
+// next in line (a program that loaded it privately), so a call is never lost here.
 namespace input_trace {
-static std::atomic<uint32_t> buttons{0}, keys{0}, motions{0};
+static std::atomic<uint32_t> buttons{0}, keys{0}, setup{0};
 
 static bool first(std::atomic<uint32_t> &n, uint32_t count) {
   uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
@@ -4110,7 +4110,7 @@ static bool first(std::atomic<uint32_t> &n, uint32_t count) {
 
 static void log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void log(const char *fmt, ...) {
-  config();  // the logger is set up there (in processes that don't touch controllers it may not have run yet)
+  config();
   char text[256];
   va_list args;
   va_start(args, fmt);
@@ -4119,103 +4119,60 @@ static void log(const char *fmt, ...) {
   Logger::log("mouse: %s\n", text);
 }
 
-static const char *display_name(void *display) {
-  using Fn = char *(*)(void *);
-  static Fn get = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "XDisplayString"));
-  const char *name = display && get ? get(display) : nullptr;
-  return name ? name : "?";
+template <typename Fn> static Fn real(const char *name, const char *library) {
+  void *fn = dlsym(RTLD_NEXT, name);
+  if (!fn) {
+    void *handle = dlopen(library, RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle) handle = dlopen(library, RTLD_LAZY);
+    if (handle) fn = dlsym(handle, name);  // the library's own definition, not this one
+  }
+  if (!fn) log("could not find the real %s in %s: this call is dropped", name, library);
+  return reinterpret_cast<Fn>(fn);
 }
 
-template <typename Fn> static Fn next(const char *name) { return reinterpret_cast<Fn>(dlsym(RTLD_NEXT, name)); }
+static const char *caps(uint32_t c) {
+  static thread_local char text[64];
+  // libei / libeis capability bits: pointer 1, pointer absolute 2, keyboard 4, touch 8, scroll 16, button 32
+  snprintf(text, sizeof(text), "%s%s%s%s%s%s", c & 1 ? " pointer" : "", c & 2 ? " absolute" : "",
+           c & 4 ? " keyboard" : "", c & 8 ? " touch" : "", c & 16 ? " scroll" : "", c & 32 ? " button" : "");
+  return text;
+}
 }  // namespace input_trace
 
-// step 1 (Steam): Xlib's XTest
-EXPORT int XTestFakeButtonEvent(void *display, unsigned int button, int is_press, unsigned long delay) {
-  static auto real = input_trace::next<int (*)(void *, unsigned int, int, unsigned long)>("XTestFakeButtonEvent");
-  int result = real ? real(display, button, is_press, delay) : 0;
-  if (input_trace::first(input_trace::buttons, 24))
-    input_trace::log("sent XTest mouse button %u %s to X display %s (%s; %u motion events so far)", button,
-                     is_press ? "press" : "release", input_trace::display_name(display), result ? "ok" : "FAILED",
-                     input_trace::motions.load());
-  return result;
-}
-
-EXPORT int XTestFakeKeyEvent(void *display, unsigned int keycode, int is_press, unsigned long delay) {
-  static auto real = input_trace::next<int (*)(void *, unsigned int, int, unsigned long)>("XTestFakeKeyEvent");
-  int result = real ? real(display, keycode, is_press, delay) : 0;
-  if (input_trace::first(input_trace::keys, 6))
-    input_trace::log("sent XTest key %u %s to X display %s (%s)", keycode, is_press ? "press" : "release",
-                     input_trace::display_name(display), result ? "ok" : "FAILED");
-  return result;
-}
-
-EXPORT int XTestFakeRelativeMotionEvent(void *display, int dx, int dy, unsigned long delay) {
-  static auto real = input_trace::next<int (*)(void *, int, int, unsigned long)>("XTestFakeRelativeMotionEvent");
-  input_trace::motions.fetch_add(1, std::memory_order_relaxed);
-  return real ? real(display, dx, dy, delay) : 0;
-}
-
-EXPORT int XTestFakeMotionEvent(void *display, int screen, int x, int y, unsigned long delay) {
-  static auto real = input_trace::next<int (*)(void *, int, int, int, unsigned long)>("XTestFakeMotionEvent");
-  input_trace::motions.fetch_add(1, std::memory_order_relaxed);
-  return real ? real(display, screen, x, y, delay) : 0;
-}
-
-// step 1 (Steam), if it uses XCB's XTest instead
-struct input_trace_cookie {
-  unsigned int sequence;
-};
-
-static void input_trace_xcb(uint8_t type, uint8_t detail) {
-  if (type == 4 || type == 5) {  // ButtonPress / ButtonRelease
-    if (input_trace::first(input_trace::buttons, 24))
-      input_trace::log("sent XTest (xcb) mouse button %u %s (%u motion events so far)", detail,
-                       type == 4 ? "press" : "release", input_trace::motions.load());
-  } else if (type == 2 || type == 3) {  // KeyPress / KeyRelease
-    if (input_trace::first(input_trace::keys, 6))
-      input_trace::log("sent XTest (xcb) key %u %s", detail, type == 2 ? "press" : "release");
-  } else if (type == 6) {  // MotionNotify
-    input_trace::motions.fetch_add(1, std::memory_order_relaxed);
-  }
-}
-
-EXPORT input_trace_cookie xcb_test_fake_input(void *c, uint8_t type, uint8_t detail, uint32_t time, uint32_t root,
-                                              int16_t x, int16_t y, uint8_t deviceid) {
-  using Fn = input_trace_cookie (*)(void *, uint8_t, uint8_t, uint32_t, uint32_t, int16_t, int16_t, uint8_t);
-  static auto real = input_trace::next<Fn>("xcb_test_fake_input");
-  input_trace_xcb(type, detail);
-  return real ? real(c, type, detail, time, root, x, y, deviceid) : input_trace_cookie{0};
-}
-
-EXPORT input_trace_cookie xcb_test_fake_input_checked(void *c, uint8_t type, uint8_t detail, uint32_t time,
-                                                      uint32_t root, int16_t x, int16_t y, uint8_t deviceid) {
-  using Fn = input_trace_cookie (*)(void *, uint8_t, uint8_t, uint32_t, uint32_t, int16_t, int16_t, uint8_t);
-  static auto real = input_trace::next<Fn>("xcb_test_fake_input_checked");
-  input_trace_xcb(type, detail);
-  return real ? real(c, type, detail, time, root, x, y, deviceid) : input_trace_cookie{0};
-}
-
-// step 2 (Xwayland): XTest handed to the compositor over libei
+// step 2 (Xwayland): the X server hands XTest input to gamescope over libei
 EXPORT void ei_device_button_button(void *device, uint32_t button, bool is_press) {
-  static auto real = input_trace::next<void (*)(void *, uint32_t, bool)>("ei_device_button_button");
+  static auto real = input_trace::real<void (*)(void *, uint32_t, bool)>("ei_device_button_button", "libei.so.1");
   if (input_trace::first(input_trace::buttons, 24))
-    input_trace::log("X server handed mouse button 0x%x %s to gamescope (libei%s)", button,
-                     is_press ? "press" : "release", real ? "" : ", NOT AVAILABLE");
+    input_trace::log("X server handed mouse button 0x%x %s to gamescope (libei)", button, is_press ? "press" : "release");
   if (real) real(device, button, is_press);
 }
 
 EXPORT void ei_device_keyboard_key(void *device, uint32_t keycode, bool is_press) {
-  static auto real = input_trace::next<void (*)(void *, uint32_t, bool)>("ei_device_keyboard_key");
+  static auto real = input_trace::real<void (*)(void *, uint32_t, bool)>("ei_device_keyboard_key", "libei.so.1");
   if (input_trace::first(input_trace::keys, 6))
-    input_trace::log("X server handed key %u %s to gamescope (libei%s)", keycode, is_press ? "press" : "release",
-                     real ? "" : ", NOT AVAILABLE");
+    input_trace::log("X server handed key %u %s to gamescope (libei)", keycode, is_press ? "press" : "release");
   if (real) real(device, keycode, is_press);
+}
+
+EXPORT bool ei_device_has_capability(void *device, uint32_t capability) {
+  static auto real = input_trace::real<bool (*)(void *, uint32_t)>("ei_device_has_capability", "libei.so.1");
+  bool has = real && real(device, capability);
+  if (input_trace::first(input_trace::setup, 24))
+    input_trace::log("X server: gamescope's input device %p %s%s", device, has ? "can send" : "can NOT send",
+                     input_trace::caps(capability));
+  return has;
+}
+
+EXPORT void ei_device_start_emulating(void *device, uint32_t sequence) {
+  static auto real = input_trace::real<void (*)(void *, uint32_t)>("ei_device_start_emulating", "libei.so.1");
+  if (input_trace::first(input_trace::setup, 24)) input_trace::log("X server: input device %p starts sending", device);
+  if (real) real(device, sequence);
 }
 
 // step 3 (gamescope): received over libeis, then delivered to the window that has the pointer
 EXPORT uint32_t eis_event_button_get_button(void *event) {
-  static auto real = input_trace::next<uint32_t (*)(void *)>("eis_event_button_get_button");
-  static auto pressed = input_trace::next<bool (*)(void *)>("eis_event_button_get_is_press");
+  static auto real = input_trace::real<uint32_t (*)(void *)>("eis_event_button_get_button", "libeis.so.1");
+  static auto pressed = input_trace::real<bool (*)(void *)>("eis_event_button_get_is_press", "libeis.so.1");
   uint32_t button = real ? real(event) : 0;
   if (input_trace::first(input_trace::buttons, 24))
     input_trace::log("gamescope received mouse button 0x%x %s (libeis)", button,
@@ -4224,12 +4181,19 @@ EXPORT uint32_t eis_event_button_get_button(void *event) {
 }
 
 EXPORT uint32_t eis_event_keyboard_get_key(void *event) {
-  static auto real = input_trace::next<uint32_t (*)(void *)>("eis_event_keyboard_get_key");
-  static auto pressed = input_trace::next<bool (*)(void *)>("eis_event_keyboard_get_key_is_press");
+  static auto real = input_trace::real<uint32_t (*)(void *)>("eis_event_keyboard_get_key", "libeis.so.1");
+  static auto pressed = input_trace::real<bool (*)(void *)>("eis_event_keyboard_get_key_is_press", "libeis.so.1");
   uint32_t key = real ? real(event) : 0;
   if (input_trace::first(input_trace::keys, 6))
     input_trace::log("gamescope received key %u %s (libeis)", key, pressed && pressed(event) ? "press" : "release");
   return key;
+}
+
+EXPORT void eis_device_configure_capability(void *device, uint32_t capability) {
+  static auto real = input_trace::real<void (*)(void *, uint32_t)>("eis_device_configure_capability", "libeis.so.1");
+  if (input_trace::first(input_trace::setup, 24))
+    input_trace::log("gamescope: its input device %p for the X server can send%s", device, input_trace::caps(capability));
+  if (real) real(device, capability);
 }
 // =================== end sdl3bridge: Steam Native Hook-up ===================
 
