@@ -1389,5 +1389,66 @@ else
   warn "droiddeck-session not found (skipping +controller_rate)"
 fi
 
+# ---------- 22. "SDL3Bridge" tab in DroidDeck's Settings ----------
+# A Settings tab that shows the bridge's controllers and changes all of its settings (mode, driver, source, poll
+# rate, bubble, per-player gyro / touchpad / button remaps / lightbar, gyro calibration) through the bridge's
+# settings messages, plus an "Open SDL3Bridge" button. Built only from DroidDeck's own settings widgets: if their
+# signatures ever change, the tab is left out (with a warning) instead of breaking the build.
+UI="$PKG/ui"
+TAB_SRC="$SRC/SdlBridgeSettings.kt"
+FES="$UI/FrontEndSetup.kt"
+if [ -f "$TAB_SRC" ] && [ -f "$FES" ] && [ -f "$UI/SettingsWidgets.kt" ]; then
+  if python3 - "$UI" "$TAB_SRC" "$FES" <<'PY'
+import os, sys
+ui, tab_src, fes = sys.argv[1:4]
+widgets = open(os.path.join(ui, "SettingsWidgets.kt"), encoding="utf-8").read()
+extra = ""
+for name in os.listdir(ui):
+    if name.endswith(".kt") and name != "SdlBridgeSettings.kt":
+        extra += open(os.path.join(ui, name), encoding="utf-8").read()
+needed = [
+    "fun SettingsGroup(title: String",
+    "fun SettingsRow(label: String, hint: String?",
+    "options: List<Pair<T, String>>, selected: T, enabled: Boolean = true",
+    "fun ToggleRow(host: MenuHost, key: String, label: String, hint: String?, checked: Boolean, enabled: Boolean = true",
+    "label: String, hint: String?, value: Int, range: IntRange, step: Int = 1, enabled: Boolean = true,",
+    "format: (Int) -> String = { it.toString() }, modifier: Modifier = Modifier, onChange: (Int) -> Unit",
+    "fun ActionRow(label: String, hint: String?, button: String, onClick: () -> Unit",
+    "fun <T> SegmentedTabs(options: List<Pair<T, String>>, selected: T?, modifier: Modifier = Modifier,",
+    "class MenuHost",
+]
+missing = [n for n in needed if n not in widgets and n not in extra]
+if missing:
+    sys.stderr.write("WIDGETS-CHANGED " + " | ".join(missing) + "\n")
+    sys.exit(4)
+dst = os.path.join(ui, "SdlBridgeSettings.kt")
+body = open(tab_src, encoding="utf-8").read()
+if not os.path.exists(dst) or open(dst, encoding="utf-8").read() != body:
+    open(dst, "w", encoding="utf-8").write(body)
+s = open(fes, encoding="utf-8").read()
+MARK = "SdlBridgeSettingsTab(host)"
+if MARK not in s:
+    edits = [
+        ('stringResource(R.string.setup_tab_glasses))', 'stringResource(R.string.setup_tab_glasses), "SDL3Bridge")'),
+        ('                    GLASSES_TAB -> GlassesSetupPanel()\n',
+         '                    GLASSES_TAB -> GlassesSetupPanel()\n'
+         '                    GLASSES_TAB + 1 -> SdlBridgeSettingsTab(host)   // sdl3bridge: SDL3Bridge tab\n'),
+    ]
+    for old, new in edits:
+        if s.count(old) != 1:
+            sys.stderr.write("ANCHOR-MISS SDL3Bridge tab :: %r (found %d)\n" % (old[:70], s.count(old)))
+            os.remove(dst)
+            sys.exit(3)
+        s = s.replace(old, new, 1)
+    open(fes, "w", encoding="utf-8").write(s)
+print("OK")
+PY
+  then ok "Settings: SDL3Bridge tab (all bridge settings + Open SDL3Bridge)"
+  else warn "SDL3Bridge settings tab left out (DroidDeck's settings screen changed; see the line above)"
+  fi
+else
+  warn "SdlBridgeSettings.kt or DroidDeck's settings screen not found (skipping the SDL3Bridge tab)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
