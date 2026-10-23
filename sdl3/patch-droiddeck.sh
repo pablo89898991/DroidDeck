@@ -1537,5 +1537,89 @@ if [ -f "$SRC/README.md" ]; then
   fi
 fi
 
+# ---------- 25. DroidDeck's own controllers: Steam reads the newest reports too (mailbox) ----------
+# The same mailbox the hooked-up controllers use (hookup_native.inc, HookupQueue) for DroidDeck's own pad nodes:
+# Steam Deck pad, DualSense / Edge, DualShock 4, Steam Controller 2015, Steam Controller 2026 (its pad and the
+# passthrough). Their reports used to go into a socket that holds a few reports: when Steam read late, the
+# newest were the ones dropped. The touch-screen node is left as it is. All or nothing: if an anchor moved, the
+# pads keep upstream's socket and the build goes on.
+if [ -f "$CPP" ] && grep -q "sdl3bridge: Steam Native Hook-up" "$CPP"; then
+  res=$(python3 - "$CPP" <<'PY'
+import sys
+cpp = sys.argv[1]
+s = open(cpp, encoding='utf-8').read()
+if "pad_mailbox_offer(*self" in s:
+    print("SKIP")
+    sys.exit(0)
+SEND = ('    if (send(self->peer, report, sizeof(report), MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&\n'
+        '        errno != EAGAIN && errno != EWOULDBLOCK)\n'
+        '      break;\n')
+OFFER = '    if (pad_mailbox_offer(*self, report, sizeof(report)) < 0) break;\n'
+edits = [
+    # forward declarations (defined in the hook-up block further down)
+    ('__attribute__((visibility("hidden"))) static void *deck_report_thread(void *arg) {\n',
+     '// sdl3bridge: Steam reads the newest reports of every controller (mailbox, see HookupQueue)\n'
+     'static void pad_mailbox_attach(DeckHidraw &pad);\n'
+     'static int pad_mailbox_offer(DeckHidraw &pad, const uint8_t *data, uint32_t length);\n\n'
+     '__attribute__((visibility("hidden"))) static void *deck_report_thread(void *arg) {\n'),
+    # the report threads: Steam Deck, Sony, Steam Controller 2015, Steam Controller 2026 pad
+    ('    build_deck_report(report, ++packet, buttons, axes, extras);\n' + SEND,
+     '    build_deck_report(report, ++packet, buttons, axes, extras);\n' + OFFER),
+    ('    build_sony_report(report, self->sony, ++packet, monotonic_us() - start_us, buttons, axes, extras, touch);\n' + SEND,
+     '    build_sony_report(report, self->sony, ++packet, monotonic_us() - start_us, buttons, axes, extras, touch);\n' + OFFER),
+    ('    build_sc1_report(report, ++packet, buttons, axes, extras);\n' + SEND,
+     '    build_sc1_report(report, ++packet, buttons, axes, extras);\n' + OFFER),
+    ('    build_triton_report(report + 1, ++packet, monotonic_us() - start_us, buttons, axes, extras);\n' + SEND,
+     '    build_triton_report(report + 1, ++packet, monotonic_us() - start_us, buttons, axes, extras);\n' + OFFER),
+    # Steam Controller 2026 passthrough
+    ('      report[0] = report_id;\n'
+     '      if (send(self->peer, report, length + 1, MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&\n'
+     '          errno != EAGAIN && errno != EWOULDBLOCK)\n'
+     '        break;\n',
+     '      report[0] = report_id;\n'
+     '      if (pad_mailbox_offer(*self, report, static_cast<uint32_t>(length + 1)) < 0) break;\n'),
+    # each pad node gets its mailbox before Steam can read it
+    ('  deck->sony = sony;\n  deck->sc1 = sc1;\n',
+     '  deck->sony = sony;\n  deck->sc1 = sc1;\n  pad_mailbox_attach(*deck);\n'),
+    ('  triton->triton = true;\n  triton->emulated = emulated;\n',
+     '  triton->triton = true;\n  triton->emulated = emulated;\n  pad_mailbox_attach(*triton);\n'),
+    # readv() and the fortified read() reach the mailbox too
+    ('EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {\n'
+     '  if (!is_fake_input_fd(fd)) return syscall(SYS_readv, fd, iov, iovcnt);\n',
+     'EXPORT ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {\n'
+     '  if (ssize_t mailbox = hookup_readv_mailbox(fd, iov, iovcnt); mailbox != -2) return mailbox;\n'
+     '  if (!is_fake_input_fd(fd)) return syscall(SYS_readv, fd, iov, iovcnt);\n'),
+    ('EXPORT ssize_t read(int fd, void *buf, size_t count) {\n  return read_input(fd, buf, count);\n}\n',
+     'EXPORT ssize_t read(int fd, void *buf, size_t count) {\n  return read_input(fd, buf, count);\n}\n\n'
+     '// sdl3bridge: read() as programs built with _FORTIFY_SOURCE call it\n'
+     'EXPORT ssize_t __read_chk(int fd, void *buf, size_t count, size_t buflen) {\n'
+     '  if (count > buflen) {  // a buffer overflow: the C library reports it, as it would without the hook\n'
+     '    static auto real = reinterpret_cast<ssize_t (*)(int, void *, size_t, size_t)>(dlsym(RTLD_NEXT, "__read_chk"));\n'
+     '    if (real) return real(fd, buf, count, buflen);\n'
+     '    abort();\n'
+     '  }\n'
+     '  return read_input(fd, buf, count);\n'
+     '}\n'),
+]
+for old, new in edits:
+    n = s.count(old)
+    if n != 1:
+        sys.stderr.write("ANCHOR-MISS pad mailbox :: %r (found %d, expected 1)\n" % (old[:80], n))
+        sys.exit(3)
+for old, new in edits:
+    s = s.replace(old, new)
+open(cpp, 'w', encoding='utf-8').write(s)
+print("OK")
+PY
+)
+  case "$res" in
+    OK) ok "DroidDeck's own controllers: Steam reads the newest reports (mailbox)" ;;
+    SKIP) skip "pad mailbox" ;;
+    *) warn "pad mailbox left out (an upstream anchor moved, see ANCHOR-MISS above); DroidDeck's pads keep their socket" ;;
+  esac
+else
+  warn "hook-up block not in fakeinput_steam.cpp (skipping the pad mailbox)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
