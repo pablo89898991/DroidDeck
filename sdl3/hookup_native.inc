@@ -147,57 +147,71 @@ __attribute__((visibility("hidden"))) static void hookup_devpath(int i, const Ho
 }
 
 // ---- latency meter (logged to pad.log every 10 s while it has samples) ----
-// Where a button press of a hooked-up controller spends its time: from the moment its report is handed to Steam
-// to Steam's virtual pad (Steam's own processing), and from there to the game reading it. Mouse / keyboard
-// output from Steam does not go through the virtual pad, so it is not part of either number.
+// Where a button press of a hooked-up controller spends its time, in three steps:
+//   1. waiting in Steam's queue: from the report being handed to Steam until Steam reads it,
+//   2. Steam's own processing: from Steam reading the press until Steam writes the mapped button on its virtual pad,
+//   3. the game: from Steam's virtual pad until the game reads it.
+// Mouse / keyboard output from Steam does not go through the virtual pad, so it is in step 1 only.
 struct HookupLatency {
   std::mutex lock;
-  uint32_t n = 0;
+  uint32_t n = 0, missed = 0;
   uint64_t sum_us = 0, max_us = 0, since_us = 0;
-  void add(const char *what, uint64_t us, uint64_t now_us) {
+  void add(const char *what, uint64_t us, uint64_t now_us, bool hit = true) {
     std::lock_guard<std::mutex> guard(lock);
     if (!since_us) since_us = now_us;
-    n++;
-    sum_us += us;
-    if (us > max_us) max_us = us;
+    if (hit) {
+      n++;
+      sum_us += us;
+      if (us > max_us) max_us = us;
+    } else {
+      missed++;
+    }
     if (now_us - since_us < 10000000ULL) return;
-    Logger::log("latency: %s: %u presses, avg %.1f ms, max %.1f ms\n", what, n, sum_us / 1000.0 / n, max_us / 1000.0);
-    n = 0;
+    if (n)
+      Logger::log("latency: %s: %u presses, avg %.1f ms, max %.1f ms%s\n", what, n, sum_us / 1000.0 / n, max_us / 1000.0,
+                  missed ? " (plus presses that never reached the pad: mapped to mouse / keyboard or nothing)" : "");
+    n = missed = 0;
     sum_us = max_us = 0;
     since_us = now_us;
   }
 };
-static std::atomic<uint64_t> g_hookup_press_us{0};   // Steam process: a press handed to Steam, not yet on its pad
 
-/** Digital buttons of a Sony controller's USB input report (DualSense / Edge, DualShock 4); 0 = layout unknown. */
+static std::atomic<uint64_t> g_hookup_press_us{0};   // Steam process: a press Steam has read, not yet on its pad
+static std::atomic<int> g_hookup_samples{0};
+
+/** For the latency meter only: gamepad-style buttons of a Sony controller's USB input report (DualSense / Edge,
+ *  DualShock 4); 0 = layout not known here. Left out: L2 / R2 (analog), PS (Steam's menu), touchpad click, mute. */
 __attribute__((visibility("hidden"))) static uint32_t hookup_buttons(const HookupSlot &s, const uint8_t *d, uint32_t n) {
   if (s.vendor != 0x054c || n < 11 || d[0] != 0x01) return 0;
   if (s.product == 0x0ce6 || s.product == 0x0df2)  // DualSense, DualSense Edge
-    return 0x80000000u | ((d[8] & 0x0f) != 8 ? 1u : 0u) | (d[8] & 0xf0u) | (uint32_t)d[9] << 8 | (uint32_t)(d[10] & 0xf7) << 16;
+    return 0x80000000u | ((d[8] & 0x0f) != 8 ? 1u : 0u) | (d[8] & 0xf0u) | (uint32_t)(d[9] & 0xf3) << 8 |
+           (uint32_t)(d[10] & 0xf0) << 16;
   if (s.product == 0x05c4 || s.product == 0x09cc)  // DualShock 4
-    return 0x80000000u | ((d[5] & 0x0f) != 8 ? 1u : 0u) | (d[5] & 0xf0u) | (uint32_t)d[6] << 8 | (uint32_t)(d[7] & 0x03) << 16;
+    return 0x80000000u | ((d[5] & 0x0f) != 8 ? 1u : 0u) | (d[5] & 0xf0u) | (uint32_t)(d[6] & 0xf3) << 8;
   return 0;
 }
 
-/** Steam process, as Steam writes its virtual pad: a key press now = the press handed to Steam earlier. */
+/** Steam process, as Steam writes its virtual pad: the end of step 2. */
 __attribute__((visibility("hidden"))) static void hookup_meter_virtual_pad(const std::vector<struct input_event> &events) {
   uint64_t press = g_hookup_press_us.load(std::memory_order_acquire);
   if (!press) return;
+  static HookupLatency stat;
   uint64_t now = monotonic_us();
-  if (now - press > 1000000ULL) {  // never reached the pad (mapped to mouse / keyboard, or nothing)
-    g_hookup_press_us.compare_exchange_strong(press, 0);
+  if (now - press > 250000ULL) {  // no gamepad button followed: mapped to mouse / keyboard, or nothing
+    if (g_hookup_press_us.compare_exchange_strong(press, 0)) stat.add("button press -> Steam's virtual pad", 0, now, false);
     return;
   }
   for (const struct input_event &ev : events) {
     if (ev.type != EV_KEY || ev.value != 1) continue;
     if (!g_hookup_press_us.compare_exchange_strong(press, 0)) return;
-    static HookupLatency stat;
-    stat.add("button press -> Steam's virtual pad", now - press, now);
+    stat.add("Steam read a button press -> on Steam's virtual pad (Steam's own processing)", now - press, now);
+    int sample = g_hookup_samples.fetch_add(1, std::memory_order_relaxed);
+    if (sample < 12) Logger::log("latency: press %d: on Steam's virtual pad %.1f ms after Steam read it\n", sample + 1, (now - press) / 1000.0);
     return;
   }
 }
 
-/** Game process, as it reads Steam's virtual pad: how long a key press waited there (stamped when Steam wrote it). */
+/** Game process, as it reads Steam's virtual pad: step 3 (stamped when Steam wrote it). */
 __attribute__((visibility("hidden"))) static void hookup_meter_game_read(const struct input_event *events, size_t count) {
   if (process_is_steam_client()) return;
   for (size_t i = 0; i < count; i++) {
@@ -217,52 +231,363 @@ struct HookupOutputStat {
   uint64_t waited_us = 0, since_us = 0;
 };
 
+/**
+ * Buttons and hat switches the controller's own HID report descriptor declares for input report `id` (0 = the
+ * controller uses no report IDs), as a bit mask over the report bytes (byte 0 = the report ID when IDs are used).
+ * Controllers with a standard descriptor get their buttons protected exactly; vendor-defined reports (Sony's extra
+ * area, Switch, Steam Controller, Xbox) declare none, and rely on what is learned from the reports.
+ */
+__attribute__((visibility("hidden"))) static void hookup_descriptor_buttons(const HookupSlot &s, uint8_t id, uint8_t *mask,
+                                                                            uint32_t length) {
+  const uint8_t *d = s.desc;
+  uint32_t n = std::min<uint32_t>(s.desc_len, HOOKUP_DESC_MAX);
+  struct Globals { uint32_t page = 0, size = 0, count = 0, id = 0; } g, stack[4];
+  int depth = 0;
+  uint32_t usages[64];
+  int nusages = 0;
+  uint32_t umin = 0, umax = 0;
+  bool range = false, ids = false;
+  uint32_t bitpos[256] = {};
+  for (uint32_t pos = 0; pos < n;) {
+    uint8_t prefix = d[pos++];
+    if (prefix == 0xfe) {  // long item
+      if (pos + 1 >= n) break;
+      pos += 2 + d[pos];
+      continue;
+    }
+    uint32_t size = prefix & 3;
+    if (size == 3) size = 4;
+    if (pos + size > n) break;
+    uint32_t v = 0;
+    for (uint32_t k = 0; k < size; k++) v |= static_cast<uint32_t>(d[pos + k]) << (8 * k);
+    pos += size;
+    uint32_t type = (prefix >> 2) & 3, tag = prefix >> 4;
+    if (type == 1) {  // global
+      if (tag == 0) g.page = v;
+      else if (tag == 7) g.size = v;
+      else if (tag == 8) { g.id = v & 0xff; ids = true; }
+      else if (tag == 9) g.count = v;
+      else if (tag == 10 && depth < 4) stack[depth++] = g;
+      else if (tag == 11 && depth > 0) g = stack[--depth];
+    } else if (type == 2) {  // local
+      if (tag == 0 && nusages < 64) usages[nusages++] = size == 4 ? v : (g.page << 16) | v;
+      else if (tag == 1) { umin = size == 4 ? v : (g.page << 16) | v; range = true; }
+      else if (tag == 2) umax = size == 4 ? v : (g.page << 16) | v;
+    } else if (type == 0) {  // main
+      if (tag == 8) {  // Input
+        uint32_t start = bitpos[g.id];
+        uint32_t bits = g.size * g.count;
+        bitpos[g.id] += bits;
+        if (!(v & 1) && g.id == id && g.size && g.size <= 32) {
+          for (uint32_t j = 0; j < g.count; j++) {
+            uint32_t usage = j < static_cast<uint32_t>(nusages) ? usages[j]
+                           : range ? std::min(umin + j, umax ? umax : umin + j)
+                           : nusages ? usages[nusages - 1] : (g.page << 16);
+            uint32_t page = usage >> 16, u = usage & 0xffff;
+            if (page != 0x09 && !(page == 0x01 && u == 0x39)) continue;
+            for (uint32_t b = start + j * g.size; b < start + (j + 1) * g.size; b++) {
+              uint32_t byte = (ids ? 1 : 0) + b / 8;
+              if (byte < length) mask[byte] |= 1u << (b % 8);
+            }
+          }
+        }
+      }
+      nusages = 0;
+      range = false;
+      umin = umax = 0;
+    }
+  }
+  (void)ids;
+}
+
+/**
+ * Which bits of a controller's reports are "moving", learned from the reports themselves for ANY controller (no
+ * report layout needed): bytes that change in more than a quarter of the last 256 reports of that kind (sticks in
+ * use, gyro, accelerometer, touch position, noise) and single bits that do; and counters / timestamps (a byte that
+ * goes up in nearly every report, and the bytes above it that only change when it wraps around). A button is never
+ * pressed that fast. Buttons the HID descriptor declares are never "moving". Until the first 256 reports are seen
+ * (and for kinds that don't stream) nothing counts as moving.
+ */
+struct HookupReportKind {
+  uint32_t length = 0;
+  uint8_t id = 0;              // first byte (the report ID on controllers that use them)
+  bool learned = false;
+  uint32_t count = 0;
+  uint8_t prev[HOOKUP_REPORT_MAX] = {};
+  bool has_prev = false;
+  uint16_t changes[HOOKUP_REPORT_MAX * 8] = {};
+  uint16_t byte_changes[HOOKUP_REPORT_MAX] = {};
+  uint16_t ups[HOOKUP_REPORT_MAX] = {};        // byte went up by 1..127 (mod 256)
+  uint16_t carried[HOOKUP_REPORT_MAX] = {};    // byte changed while the byte below it wrapped around
+  uint16_t uncarried[HOOKUP_REPORT_MAX] = {};  // byte changed while the byte below it did not wrap
+  uint8_t moving[HOOKUP_REPORT_MAX] = {};      // 1 bits = moving (or part of a counter)
+  bool analog[HOOKUP_REPORT_MAX] = {};         // the whole byte is moving, and it is not a counter
+  uint8_t buttons[HOOKUP_REPORT_MAX] = {};     // declared buttons / hat switches (HID descriptor)
+  uint8_t given[HOOKUP_REPORT_MAX] = {};       // the last report of this kind Steam got
+  bool has_given = false;
+  uint64_t window_us = 0;
+  void learn(const uint8_t *d, uint64_t now_us) {
+    if (!window_us) window_us = now_us;
+    if (has_prev) {
+      for (uint32_t i = 0; i < length; i++) {
+        uint8_t x = d[i] ^ prev[i];
+        if (!x) continue;
+        byte_changes[i]++;
+        for (uint32_t b = x; b; b &= b - 1) changes[i * 8 + __builtin_ctz(b)]++;
+        if (static_cast<int8_t>(d[i] - prev[i]) > 0) ups[i]++;
+        if (i > 0) {
+          if (d[i - 1] < prev[i - 1]) carried[i]++; else uncarried[i]++;
+        }
+      }
+    }
+    memcpy(prev, d, length);
+    has_prev = true;
+    if (++count < 256) return;
+    bool counter[HOOKUP_REPORT_MAX] = {};
+    for (uint32_t i = 0; i < length; i++) {
+      if (ups[i] >= 200) counter[i] = true;                                   // goes up in ~80 % of reports
+      else if (i > 0 && counter[i - 1] && carried[i] >= 2 && !uncarried[i]) counter[i] = true;  // its upper part
+      analog[i] = !counter[i] && byte_changes[i] > 64 && !buttons[i];
+      uint8_t m = counter[i] || byte_changes[i] > 64 ? 0xff : 0;
+      for (int b = 0; b < 8; b++)
+        if (changes[i * 8 + b] > 64) m |= 1u << b;
+      moving[i] = m & ~buttons[i];
+    }
+    memset(changes, 0, sizeof(changes));
+    memset(byte_changes, 0, sizeof(byte_changes));
+    memset(ups, 0, sizeof(ups));
+    memset(carried, 0, sizeof(carried));
+    memset(uncarried, 0, sizeof(uncarried));
+    count = 0;
+    // Only a kind that streams (256 reports within 5 s) is ever replaced: rarer kinds -- replies to Steam's
+    // commands, status reports -- always reach Steam one by one.
+    learned = now_us - window_us < 5000000ULL;
+    window_us = now_us;
+  }
+  /**
+   * Would replacing `older` by `newer` lose a change Steam has not seen -- a button-like bit that changed (compared
+   * with `base`, what Steam has or will get) and changed back? That is a short press-and-release (or the reverse)
+   * that must reach Steam. Not counted: moving bits (their next value carries them), and the carry of an analog
+   * value crossing a boundary: a bit that changed together with lower bits of its byte, or a byte that moved by
+   * 1..3 right above an analog byte (the upper half of a 16-bit value). A declared button always counts.
+   */
+  bool loses_change(const uint8_t *older, const uint8_t *newer, const uint8_t *base) const {
+    for (uint32_t i = 0; i < length; i++) {
+      uint8_t changed = older[i] ^ base[i];
+      uint8_t reverted = changed & ~(newer[i] ^ base[i]) & ~moving[i];
+      for (uint32_t r = reverted; r; r &= r - 1) {
+        int b = __builtin_ctz(r);
+        if (buttons[i] & (1u << b)) return true;
+        if (changed & ((1u << b) - 1)) continue;
+        int delta = static_cast<int8_t>(older[i] - base[i]);
+        if (i > 0 && analog[i - 1] && delta >= -3 && delta <= 3) continue;
+        return true;
+      }
+    }
+    return false;
+  }
+  /** A non-moving bit that went from 0 to 1 (most likely a press; for the latency meter). */
+  bool state_rise(const uint8_t *d, const uint8_t *ref) const {
+    for (uint32_t i = 0; i < length; i++)
+      if (d[i] & ~ref[i] & ~moving[i]) return true;
+    return false;
+  }
+};
+
+/**
+ * Controller reports -> Steam's /dev/hidraw node, for every controller: a mailbox read at the moment Steam reads.
+ * The report thread keeps the reports Steam has not read yet; Steam's read() of the node is answered from here
+ * (hookup_read_steam), and the node's socket only carries a 1-byte "something to read" token, so poll() works
+ * as on a real node. Latest wins: a newer report replaces the waiting one, so whenever Steam reads, it gets the
+ * newest state -- even when it reads late. A report is only kept (and reaches Steam in order) when replacing it
+ * would lose a change: a button-like bit that changed and changed back before Steam read it, like a press shorter
+ * than Steam's read cycle (HookupReportKind::loses_change). Reports of kinds that don't stream are never replaced.
+ * (Before, reports went into a small socket queue: when Steam read slowly it filled up, the NEWEST reports were the
+ * ones dropped and Steam read old ones -- a press could reach it one or more of its read cycles late.)
+ */
+struct HookupQueue {
+  struct Entry {
+    int kind;            // index in kinds, -1 = beyond the 4 kinds tracked (always kept)
+    bool kept;           // never replaced or dropped before Steam reads it
+    uint32_t length;
+    uint64_t arrived_us;
+    uint8_t data[HOOKUP_REPORT_MAX];
+  };
+  static constexpr int MAX = 16;
+  std::mutex lock;
+  Entry entries[MAX];
+  int n = 0;
+  HookupReportKind kinds[4];
+  int nkinds = 0;
+  bool token = false;    // the "something to read" byte is in Steam's socket
+  bool closed = false;   // the report thread ended (controller gone)
+  uint64_t press_at_arrival = 0;   // latency meter: arrival time of the entry that carries a new press
+  // 10 s summary
+  uint32_t arrived = 0, handed = 0, replaced = 0, lost = 0;
+  uint64_t wait_sum_us = 0, wait_max_us = 0;
+};
+
+/** Steam process, as Steam reads a report from the mailbox: step 1 of the latency meter, and the start of step 2. */
+__attribute__((visibility("hidden"))) static void hookup_meter_handed(const HookupSlot *s, HookupQueue &q,
+                                                                      const HookupQueue::Entry &e, uint64_t now) {
+  uint64_t wait = now - e.arrived_us;
+  q.handed++;
+  q.wait_sum_us += wait;
+  if (wait > q.wait_max_us) q.wait_max_us = wait;
+  HookupReportKind *k = e.kind >= 0 ? &q.kinds[e.kind] : nullptr;
+  bool press;
+  uint32_t now_buttons = s ? hookup_buttons(*s, e.data, e.length) : 0;
+  if (now_buttons) {
+    uint32_t was = k && k->has_given ? hookup_buttons(*s, k->given, e.length) : 0;
+    press = now_buttons & ~was & 0x7fffffffu;
+  } else {
+    press = k && k->learned && k->has_given && k->state_rise(e.data, k->given);
+  }
+  if (!press) return;
+  static HookupLatency stat;
+  stat.add("button press waited for Steam to read it", wait, now);
+  g_hookup_press_us.store(now, std::memory_order_release);
+  int sample = g_hookup_samples.load(std::memory_order_relaxed);
+  if (sample < 12) Logger::log("latency: press %d: Steam read it %.1f ms after it arrived\n", sample + 1, wait / 1000.0);
+}
+
+/** Steam's read() of a hooked-up node: the next report from the mailbox (see HookupQueue). */
+__attribute__((visibility("hidden"))) static ssize_t hookup_read_steam(int fd, int slot, HookupQueue &q, void *buf,
+                                                                      size_t count) {
+  HookupSlot *s = hookup_slot(slot);
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> guard(q.lock);
+      if (q.n) {
+        HookupQueue::Entry e = q.entries[0];
+        for (int i = 0; i < q.n - 1; i++) q.entries[i] = q.entries[i + 1];
+        q.n--;
+        if (!q.n && q.token) {  // nothing left: take the token back so poll() reports "nothing to read"
+          uint8_t token;
+          if (recv(fd, &token, 1, MSG_DONTWAIT) < 0) {}
+          q.token = false;
+        }
+        size_t copied = std::min<size_t>(count, e.length);
+        memcpy(buf, e.data, copied);
+        hookup_meter_handed(s, q, e, monotonic_us());
+        if (e.kind >= 0) {
+          memcpy(q.kinds[e.kind].given, e.data, e.length);
+          q.kinds[e.kind].has_given = true;
+        }
+        return static_cast<ssize_t>(copied);
+      }
+      if (q.closed) return 0;  // the controller is gone: end of file, as on a real node
+    }
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0 && (flags & O_NONBLOCK)) {
+      errno = EAGAIN;
+      return -1;
+    }
+    struct pollfd p = {fd, POLLIN, 0};
+    if (syscall(SYS_ppoll, &p, 1, nullptr, nullptr, 0) < 0 && errno != EINTR) return -1;  // until there is something
+    if (p.revents & (POLLHUP | POLLERR)) {
+      std::lock_guard<std::mutex> guard(q.lock);
+      if (!q.n) return 0;
+    }
+  }
+}
+
 __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *arg) {
   auto *holder = static_cast<std::shared_ptr<DeckHidraw> *>(arg);
   std::shared_ptr<DeckHidraw> self = *holder;
   delete holder;
   HookupSlot *s = hookup_slot(self->hookup);
+  std::shared_ptr<HookupQueue> qp = self->hookup_in;
+  HookupQueue &q = *qp;
   uint64_t next = s ? __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE) : 0;
-  unsigned unread = 0;
   uint64_t meter_us = monotonic_us();
-  uint32_t buttons_was = 0;
+  auto kind_of = [&](const uint8_t *d, uint32_t length) {
+    for (int i = 0; i < q.nkinds; i++)
+      if (q.kinds[i].length == length && q.kinds[i].id == d[0]) return i;
+    if (q.nkinds == 4) return -1;
+    HookupReportKind &k = q.kinds[q.nkinds];
+    k.length = length;
+    k.id = d[0];
+    hookup_descriptor_buttons(*s, d[0], k.buttons, length);       // report IDs: byte 0 is the ID
+    uint8_t no_ids[HOOKUP_REPORT_MAX] = {};
+    hookup_descriptor_buttons(*s, 0, no_ids, length);              // no IDs: the report starts at once
+    for (uint32_t i = 0; i < length; i++) k.buttons[i] |= no_ids[i];
+    return q.nkinds++;
+  };
+  bool peer_gone = false;
   while (s && __atomic_load_n(&s->present, __ATOMIC_ACQUIRE) &&
          __atomic_load_n(&s->generation, __ATOMIC_ACQUIRE) == self->hookup_generation) {
     uint64_t written = __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE);
     if (written - next > HOOKUP_IN_FIFO) next = written - HOOKUP_IN_FIFO;  // fell behind: skip the oldest
-    bool failed = false;
     while (next < written) {
       const HookupReport &r = s->in[next % HOOKUP_IN_FIFO];
-      uint8_t data[HOOKUP_REPORT_MAX];
+      HookupQueue::Entry e;
       uint32_t length = __atomic_load_n(&r.length, __ATOMIC_RELAXED);
       if (length > HOOKUP_REPORT_MAX) length = HOOKUP_REPORT_MAX;
-      memcpy(data, r.data, length);
+      memcpy(e.data, r.data, length);
       __atomic_thread_fence(__ATOMIC_ACQUIRE);
       bool intact = __atomic_load_n(&r.seq, __ATOMIC_ACQUIRE) == next + 1;
       next++;
       if (!intact || !length) continue;
-      uint32_t buttons = hookup_buttons(*s, data, length);
-      if (buttons & ~buttons_was & 0x7fffffffu) {
-        uint64_t none = 0;
-        g_hookup_press_us.compare_exchange_strong(none, monotonic_us());
-      }
-      buttons_was = buttons;
-      if (send(self->peer, data, length, MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-          failed = true;
-          break;
+      uint64_t now = monotonic_us();
+      e.length = length;
+      e.arrived_us = now;
+      std::lock_guard<std::mutex> guard(q.lock);
+      q.arrived++;
+      e.kind = kind_of(e.data, length);
+      HookupReportKind *k = e.kind >= 0 ? &q.kinds[e.kind] : nullptr;
+      e.kept = !k;
+      if (k) k->learn(e.data, now);
+      // the newest replaceable report of the same kind waiting, and what Steam has / will get before it
+      int last = -1;
+      for (int i = q.n - 1; i >= 0 && k && k->learned; i--)
+        if (q.entries[i].kind == e.kind && !q.entries[i].kept) { last = i; break; }
+      bool replaced = false;
+      if (last >= 0) {
+        const uint8_t *base = nullptr;
+        for (int i = last - 1; i >= 0 && !base; i--)
+          if (q.entries[i].kind == e.kind) base = q.entries[i].data;
+        if (!base && k->has_given) base = k->given;
+        if (base && !k->loses_change(q.entries[last].data, e.data, base)) {
+          q.entries[last] = e;  // latest wins
+          q.replaced++;
+          replaced = true;
+        } else {
+          q.entries[last].kept = true;  // it carries a change the new one undoes: it must reach Steam
         }
-        unread++;  // Steam has not read the previous reports yet
+      }
+      if (!replaced) {
+        if (q.n == HookupQueue::MAX) {  // Steam stopped reading for a while: make room, oldest replaceable first
+          int drop = 0;
+          for (int i = 0; i < q.n; i++)
+            if (!q.entries[i].kept) { drop = i; break; }
+          if (!q.entries[drop].kept) q.replaced++;
+          else if (q.entries[drop].kind >= 0 && q.kinds[q.entries[drop].kind].learned) q.lost++;
+          for (int i = drop; i < q.n - 1; i++) q.entries[i] = q.entries[i + 1];
+          q.n--;
+        }
+        q.entries[q.n++] = e;
+      }
+      if (!q.token && !peer_gone) {  // tell Steam's poll() there is something to read
+        uint8_t token = 1;
+        if (send(self->peer, &token, 1, MSG_DONTWAIT | MSG_NOSIGNAL) == 1) q.token = true;
+        else if (errno != EAGAIN && errno != EWOULDBLOCK) peer_gone = true;
       }
     }
-    if (failed) break;
-    // Lag meter: reports Steam did not read in time (its socket was full), logged every 10 s when it happened.
+    if (peer_gone) break;  // Steam closed the node
+    // 10 s summary, logged when Steam was slow to read (replacing reports, or reading them late)
     uint64_t now_us = monotonic_us();
     if (now_us - meter_us >= 10000000ULL) {
-      if (unread)
-        Logger::log("hookup: /dev/hidraw%u: Steam read too slowly, %u reports not taken in the last 10 s\n",
-                    HOOKUP_MINOR_BASE + self->hookup, unread);
-      unread = 0;
+      std::lock_guard<std::mutex> guard(q.lock);
+      double secs = (now_us - meter_us) / 1e6;
+      if (q.replaced || q.lost || (q.handed && q.wait_sum_us / q.handed > 2000))
+        Logger::log("hookup: /dev/hidraw%u: %.0f reports/s from the controller, Steam read %.0f/s, each the newest "
+                    "(avg %.1f ms after it arrived, max %.1f ms); %u replaced by a newer one while Steam was busy%s\n",
+                    HOOKUP_MINOR_BASE + self->hookup, q.arrived / secs, q.handed / secs,
+                    q.handed ? q.wait_sum_us / 1000.0 / q.handed : 0.0, q.wait_max_us / 1000.0, q.replaced,
+                    q.lost ? " -- Steam stopped reading for a while, some short presses were dropped" : "");
+      q.arrived = q.handed = q.replaced = q.lost = 0;
+      q.wait_sum_us = q.wait_max_us = 0;
       meter_us = now_us;
     }
     // Sleep until the next report. The SDL3 bridge's fast path wakes this futex the moment it writes one (the
@@ -272,6 +597,10 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
     struct timespec wait = {0, (fast ? 4000L : 500L) * 1000L};
     syscall(SYS_futex, reinterpret_cast<uint32_t *>(&s->in_write), HOOKUP_FUTEX_WAIT, static_cast<uint32_t>(written),
             &wait, nullptr, 0);
+  }
+  {
+    std::lock_guard<std::mutex> guard(q.lock);
+    q.closed = true;
   }
   syscall(SYS_close, self->peer);
   return nullptr;
@@ -285,8 +614,7 @@ __attribute__((visibility("hidden"))) static int open_hookup_hidraw(int flags, i
   }
   int pair[2];
   if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) < 0) return -1;
-  // Small, like DroidDeck's own controller nodes (about 6 reports): when Steam reads slower than the controller
-  // sends, it gets near-current input instead of working through a long line of old reports.
+  // The socket only carries the mailbox's 1-byte "something to read" token (see HookupQueue): small is plenty.
   int buffer = HOOKUP_REPORT_MAX * 4;
   setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
   if (!(flags & O_CLOEXEC)) fcntl(pair[0], F_SETFD, 0);
@@ -295,6 +623,7 @@ __attribute__((visibility("hidden"))) static int open_hookup_hidraw(int flags, i
   pad->peer = pair[1];
   pad->hookup = static_cast<int8_t>(slot);
   pad->hookup_generation = __atomic_load_n(&s->generation, __ATOMIC_ACQUIRE);
+  pad->hookup_in = std::make_shared<HookupQueue>();
   {
     std::lock_guard<std::recursive_mutex> guard(controller_mutex());
     deck_map()[pair[0]] = pad;
@@ -511,7 +840,15 @@ __attribute__((visibility("hidden"))) static void hookup_ff_to_steam() {
 __attribute__((visibility("hidden"))) static ssize_t hookup_read_uinput(int fd, void *buf, size_t count) {
   std::unique_lock<std::recursive_mutex> guard(controller_mutex());
   auto made = uinput_map().find(fd);
-  if (made == uinput_map().end()) return -2;
+  if (made == uinput_map().end()) {
+    // Steam reading a hooked-up controller: answered from its mailbox (HookupQueue), unlocked
+    auto deck = deck_map().find(fd);
+    if (deck == deck_map().end() || deck->second->hookup < 0 || !deck->second->hookup_in) return -2;
+    std::shared_ptr<HookupQueue> q = deck->second->hookup_in;
+    int slot = deck->second->hookup;
+    guard.unlock();
+    return hookup_read_steam(fd, slot, *q, buf, count);
+  }
   std::shared_ptr<UinputWriter> w = made->second;
   if (count < sizeof(struct input_event)) {
     errno = EINVAL;

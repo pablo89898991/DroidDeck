@@ -953,7 +953,8 @@ rep('#include <vector>\n', '#include <vector>\n#include <deque>\n')
 rep('  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n};',
     '  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n'
     '  int8_t hookup = -1;  // sdl3bridge: Steam Native Hook-up slot\n'
-    '  uint32_t hookup_generation = 0;\n};')
+    '  uint32_t hookup_generation = 0;\n'
+    '  std::shared_ptr<struct HookupQueue> hookup_in;  // sdl3bridge: reports waiting for Steam (mailbox)\n};')
 # UinputWriter: force-feedback requests queued for Steam
 rep('  uint32_t buttons = 0;\n  int16_t axes[8] = {};\n};',
     '  uint32_t buttons = 0;\n  int16_t axes[8] = {};\n'
@@ -1525,6 +1526,15 @@ PY
   fi
 else
   warn "session drawer files or the SDL3Bridge tab not found (skipping the drawer page)"
+fi
+
+# ---------- 24. The fork's own README (only when one is shipped next to this script) ----------
+# Upstream's README comes back with every sync; a fork that keeps its own README as sdl3/README.md gets it put
+# back at the root of the build branch. (No README next to the script = nothing changes.)
+if [ -f "$SRC/README.md" ]; then
+  if cmp -s "$SRC/README.md" "$DD/README.md"; then skip "fork README"
+  else cp "$SRC/README.md" "$DD/README.md" && ok "fork README installed at the root"
+  fi
 fi
 
 echo
