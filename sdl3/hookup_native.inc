@@ -337,6 +337,7 @@ struct HookupReportKind {
   uint8_t moving[HOOKUP_REPORT_MAX] = {};      // 1 bits = moving (or part of a counter)
   bool analog[HOOKUP_REPORT_MAX] = {};         // the whole byte is moving, and it is not a counter
   uint8_t buttons[HOOKUP_REPORT_MAX] = {};     // declared buttons / hat switches (HID descriptor)
+  uint8_t noisy[HOOKUP_REPORT_MAX] = {};       // bits that change in over a quarter of reports, declared or not
   uint8_t given[HOOKUP_REPORT_MAX] = {};       // the last report of this kind Steam got
   bool has_given = false;
   uint64_t window_us = 0;
@@ -366,6 +367,7 @@ struct HookupReportKind {
       for (int b = 0; b < 8; b++)
         if (changes[i * 8 + b] > 64) m |= 1u << b;
       moving[i] = m & ~buttons[i];
+      noisy[i] = m;
     }
     memset(changes, 0, sizeof(changes));
     memset(byte_changes, 0, sizeof(byte_changes));
@@ -388,7 +390,7 @@ struct HookupReportKind {
   bool loses_change(const uint8_t *older, const uint8_t *newer, const uint8_t *base) const {
     for (uint32_t i = 0; i < length; i++) {
       uint8_t changed = older[i] ^ base[i];
-      uint8_t reverted = changed & ~(newer[i] ^ base[i]) & ~moving[i];
+      uint8_t reverted = changed & ~(newer[i] ^ base[i]) & ~noisy[i];  // noisy: moving bits, and declared ones that act so
       for (uint32_t r = reverted; r; r &= r - 1) {
         int b = __builtin_ctz(r);
         if (buttons[i] & (1u << b)) return true;
@@ -403,14 +405,16 @@ struct HookupReportKind {
   /**
    * For the latency meter, any controller: a button press since `ref` -- a declared button (HID descriptor) that
    * turned on, or, for controllers that declare none, a learned non-moving bit that turned on (not the carry of an
-   * analog value crossing a boundary, as in loses_change).
+   * analog value crossing a boundary, as in loses_change). Bits that change in over a quarter of reports are never
+   * a press, even when the descriptor calls them buttons (some controllers, e.g. a DualSense Edge, declare bits
+   * that change constantly): nobody presses a button that fast, and counting them buried the real presses.
    */
   bool press(const uint8_t *d, const uint8_t *ref) const {
     bool declared = false;
     for (uint32_t i = 0; i < length; i++) {
       if (!buttons[i]) continue;
       declared = true;
-      if (d[i] & ~ref[i] & buttons[i]) return true;
+      if (d[i] & ~ref[i] & buttons[i] & ~noisy[i]) return true;
     }
     if (declared || !learned) return false;
     for (uint32_t i = 0; i < length; i++) {
