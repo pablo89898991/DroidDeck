@@ -948,7 +948,7 @@ def rep(old, new, want=1):
         sys.exit(3)
     s = s.replace(old, new)
 
-rep('#include <vector>\n', '#include <vector>\n#include <deque>\n#include <sys/resource.h>\n')
+rep('#include <vector>\n', '#include <vector>\n#include <deque>\n#include <condition_variable>\n#include <sys/resource.h>\n')
 # DeckHidraw: which hook-up slot a hidraw fd serves
 rep('  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n};',
     '  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n'
@@ -959,7 +959,9 @@ rep('  bool sc1 = false;  // sdl3bridge: Steam Controller (2015)\n};',
 rep('  uint32_t buttons = 0;\n  int16_t axes[8] = {};\n};',
     '  uint32_t buttons = 0;\n  int16_t axes[8] = {};\n'
     '  std::deque<struct input_event> ff_queue;  // sdl3bridge: game rumble handed to Steam\n'
-    '  uint64_t ff_seen = 0;\n  uint32_t ff_request = 0;\n  struct ff_effect ff_effect = {};\n};')
+    '  uint64_t ff_seen = 0;\n  uint32_t ff_request = 0;\n  struct ff_effect ff_effect = {};\n'
+    '  uint64_t paced_us = 0;  // sdl3bridge: when the game last got a frame (virtual pad pacing)\n'
+    '  bool held = false, flush_now = false;\n};')
 # game rumble on a virtual pad -> shared state for Steam
 rep('__attribute__((visibility("hidden"))) static void\nsend_vibration(int strong, int weak, uint16_t duration_ms, uint16_t slot) {\n',
     'static void hookup_ff_from_game(uint16_t slot, int strong, int weak, uint16_t length);\n\n'
@@ -1055,9 +1057,11 @@ rep('    auto device = deck_map()[fd];\n    for (int i = 0; i < iovcnt; i++) {\n
     '    for (int i = 0; i < iovcnt; i++) {\n')
 # latency meter: Steam writing its virtual pad, and a game reading it
 rep('__attribute__((visibility("hidden"))) static void flush_uinput(UinputWriter &w) {\n',
-    'static void hookup_meter_virtual_pad(const std::vector<struct input_event> &events);\n\n'
+    'static void hookup_meter_virtual_pad(const std::vector<struct input_event> &events);\n'
+    'static bool virtual_pad_hold(UinputWriter &w);\n\n'
     '__attribute__((visibility("hidden"))) static void flush_uinput(UinputWriter &w) {\n'
-    '  if (w.published) hookup_meter_virtual_pad(w.pending);\n')
+    '  if (w.published && !w.flush_now) hookup_meter_virtual_pad(w.pending);\n'
+    '  if (w.published && virtual_pad_hold(w)) return;  // sdl3bridge: stick / trigger moves paced for the game\n')
 rep('          if (copied > 0) fake.read_seq += copied / sizeof(struct input_event);\n',
     '          if (copied > 0) fake.read_seq += copied / sizeof(struct input_event);\n'
     '          if (copied > 0 && fake.uinput) hookup_meter_game_read(input_events.data(), copied / sizeof(struct input_event));\n')

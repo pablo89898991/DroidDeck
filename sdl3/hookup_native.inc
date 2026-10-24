@@ -205,6 +205,8 @@ __attribute__((visibility("hidden"))) static void hookup_boost_this_thread(const
   }
 }
 static std::atomic<int> g_hookup_samples{0};
+static std::atomic<uint32_t> g_vpad_passed{0};   // frames of Steam's virtual pad handed to the game (pacing below)
+static uint64_t virtual_pad_interval_us();
 
 /** Steam process, as Steam writes its virtual pad: the end of step 2. */
 __attribute__((visibility("hidden"))) static void hookup_meter_virtual_pad(const std::vector<struct input_event> &events) {
@@ -216,9 +218,11 @@ __attribute__((visibility("hidden"))) static void hookup_meter_virtual_pad(const
     if (!was) since.compare_exchange_strong(was, t);
     if (!events.empty()) updates.fetch_add(1, std::memory_order_relaxed);
     if (was && t - was >= 10000000ULL && since.compare_exchange_strong(was, t)) {
-      uint32_t n = updates.exchange(0);
+      uint32_t n = updates.exchange(0), passed = g_vpad_passed.exchange(0);
+      double secs = (t - was) / 1e6;
       if (n && (logged.fetch_add(1) < 3 || n > 4000))
-        Logger::log("latency: Steam updates its virtual pad %.0f times a second\n", n / ((t - was) / 1e6));
+        Logger::log("latency: Steam updates its virtual pad %.0f times a second; the game gets %.0f%s\n", n / secs,
+                    passed / secs, virtual_pad_interval_us() ? " (stick / trigger moves paced, buttons at once)" : "");
     }
   }
   uint64_t press = g_hookup_press_us.load(std::memory_order_acquire);
@@ -237,6 +241,138 @@ __attribute__((visibility("hidden"))) static void hookup_meter_virtual_pad(const
     if (sample < 12) Logger::log("latency: press %d: on Steam's virtual pad %.1f ms after Steam read it\n", sample + 1, (now - press) / 1000.0);
     return;
   }
+}
+
+// ---- Steam's virtual pad, paced for the game (every controller, every mode) ----
+// Steam writes its virtual pad each time a controller report changes its state: with a controller that sends 1000
+// reports a second (a DualSense over USB in Steam Native Hook-up) about that often. A Windows game gets each update
+// passed along one by one inside Wine, and under x86 emulation that falls behind: the game lags -- unplayable at
+// 1000 Hz, fine at 250 Hz, the rate DroidDeck's own pads send. So stick / trigger movement reaches the game at most
+// 250 times a second, merged to the newest values; buttons are never held: a frame with a button change goes out
+// at once (after the newest axis values). Steam itself still reads the controller at full rate, so gyro-to-mouse
+// and mouse / keyboard bindings (not through the virtual pad) keep it. FAKE_VIRTUAL_PAD_HZ sets another rate
+// (0 = every update, as before).
+__attribute__((visibility("hidden"))) static uint64_t virtual_pad_interval_us() {
+  static const uint64_t interval = [] {
+    const char *v = getenv("FAKE_VIRTUAL_PAD_HZ");
+    long hz = v && *v ? strtol(v, nullptr, 10) : 250;
+    return hz > 0 && hz < 1000000 ? static_cast<uint64_t>(1000000 / hz) : 0;
+  }();
+  return interval;
+}
+
+/** Only the newest value of each axis, then one SYN_REPORT. */
+__attribute__((visibility("hidden"))) static void virtual_pad_merge(std::vector<struct input_event> &events) {
+  std::vector<struct input_event> merged;
+  merged.reserve(events.size());
+  struct input_event syn = {};
+  bool has_syn = false;
+  for (const struct input_event &ev : events) {
+    if (ev.type == EV_SYN) {
+      if (ev.code == SYN_REPORT) {
+        syn = ev;
+        has_syn = true;
+      }
+      continue;
+    }
+    bool replaced = false;
+    for (struct input_event &m : merged)
+      if (m.type == ev.type && m.code == ev.code) {
+        m = ev;
+        replaced = true;
+        break;
+      }
+    if (!replaced) merged.push_back(ev);
+  }
+  if (has_syn) merged.push_back(syn);
+  events.swap(merged);
+}
+
+// Never destroyed (allocated once): at exit the pacer thread is still waiting on them, and destroying a condition
+// variable with a waiter blocks forever -- the process would hang on quit.
+static std::mutex &g_vpad_lock = *new std::mutex();
+static std::condition_variable &g_vpad_cv = *new std::condition_variable();
+static uint64_t g_vpad_due = 0;
+static pid_t g_vpad_thread_pid = 0;
+
+__attribute__((visibility("hidden"))) static void *virtual_pad_pacer(void *);
+
+/** Frames are held: hand them to the game at `due` (the pacer thread), unless Steam's next frame comes first. */
+__attribute__((visibility("hidden"))) static void virtual_pad_wake(uint64_t due) {
+  std::lock_guard<std::mutex> guard(g_vpad_lock);
+  if (!g_vpad_due || due < g_vpad_due) g_vpad_due = due;
+  if (g_vpad_thread_pid != getpid()) {  // once per process (not inherited by a fork)
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, virtual_pad_pacer, nullptr) == 0) {
+      pthread_detach(thread);
+      g_vpad_thread_pid = getpid();
+    }
+  }
+  g_vpad_cv.notify_one();
+}
+
+__attribute__((visibility("hidden"))) static void *virtual_pad_pacer(void *) {
+  hookup_boost_this_thread("passes Steam's virtual controller on to games");
+  std::unique_lock<std::mutex> lock(g_vpad_lock);
+  for (;;) {
+    if (!g_vpad_due) {
+      g_vpad_cv.wait(lock);
+      continue;
+    }
+    uint64_t now = monotonic_us();
+    if (now < g_vpad_due) {
+      g_vpad_cv.wait_for(lock, std::chrono::microseconds(g_vpad_due - now));
+      continue;
+    }
+    g_vpad_due = 0;
+    lock.unlock();
+    {
+      std::lock_guard<std::recursive_mutex> guard(controller_mutex());
+      uint64_t interval = virtual_pad_interval_us();
+      for (auto &entry : uinput_map()) {
+        UinputWriter &w = *entry.second;
+        if (!w.held) continue;
+        if (monotonic_us() - w.paced_us + 200 >= interval) {  // due (within 0.2 ms)
+          w.flush_now = true;
+          flush_uinput(w);
+          w.flush_now = false;
+        } else {
+          virtual_pad_wake(w.paced_us + interval);
+        }
+      }
+    }
+    lock.lock();
+  }
+  return nullptr;
+}
+
+/** flush_uinput: true = hold these events for now (they stay in w.pending, merged); false = write them. */
+__attribute__((visibility("hidden"))) static bool virtual_pad_hold(UinputWriter &w) {
+  uint64_t interval = virtual_pad_interval_us();
+  if (!interval || w.pending.empty()) {
+    w.held = false;
+    return false;
+  }
+  const struct input_event &last = w.pending.back();
+  if (last.type != EV_SYN || last.code != SYN_REPORT) return false;  // a partial frame (64 events): as before
+  bool only_axes = true;
+  for (const struct input_event &ev : w.pending)
+    if (ev.type != EV_ABS && ev.type != EV_SYN) {
+      only_axes = false;
+      break;
+    }
+  uint64_t now = monotonic_us();
+  if (!only_axes || w.flush_now || now - w.paced_us >= interval) {
+    if (only_axes) virtual_pad_merge(w.pending);  // held frames and this one: one frame, the newest values
+    w.paced_us = now;
+    w.held = false;
+    g_vpad_passed.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  virtual_pad_merge(w.pending);
+  w.held = true;
+  virtual_pad_wake(w.paced_us + interval);
+  return true;
 }
 
 /** Game process, as it reads Steam's virtual pad: step 3 (stamped when Steam wrote it). */
