@@ -1936,6 +1936,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 SessionState.relaunch?.let { next ->
                     SessionState.relaunch = null
                     next.putExtra(EXTRA_RETURN_HOME, intent.getBooleanExtra(EXTRA_RETURN_HOME, false))
+                    next.putExtra(EXTRA_LINK_TASK, intent.getIntExtra(EXTRA_LINK_TASK, -1))
                     setIntent(next)
                     recreate()
                     return@runOnUiThread
@@ -3038,6 +3039,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             return
         }
         if (this.intent.getBooleanExtra(EXTRA_RETURN_HOME, false)) intent.putExtra(EXTRA_RETURN_HOME, true)
+        if (!intent.hasExtra(EXTRA_LINK_TASK)) intent.putExtra(EXTRA_LINK_TASK, this.intent.getIntExtra(EXTRA_LINK_TASK, -1))
         setIntent(intent)
         if (intent.getBooleanExtra(EXTRA_STEAMVR, false) && SessionState.mode == SessionService.MODE_STEAM) {
             SessionState.steamVr = true
@@ -3561,15 +3563,31 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             }
             return
         }
-        super.finish()
         if (!closeAtOnce && intent.getBooleanExtra(EXTRA_RETURN_HOME, false)) {
             com.droiddeck.launcher.ui.QuitFlood.take()
             com.droiddeck.launcher.ui.LaunchOrigin.flooding = null
-            startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        }
+            closeLinkTasks()
+            if (!isTaskRoot) moveTaskToBack(true)
+            super.finishAndRemoveTask()
+        } else super.finish()
         if (quitFlooded) overridePendingTransition(0, 0)
         else overridePendingTransition(R.anim.session_hold, R.anim.session_sink)
+    }
+
+    private fun closeLinkTasks() {
+        val linkTask = intent.getIntExtra(EXTRA_LINK_TASK, -1)
+        if (linkTask == -1) return
+        val tasks = runCatching { getSystemService(android.app.ActivityManager::class.java)?.appTasks }.getOrNull().orEmpty()
+        for (task in tasks) {
+            runCatching {
+                val info = task.taskInfo
+                @Suppress("DEPRECATION")
+                val id = if (android.os.Build.VERSION.SDK_INT >= 29) info.taskId else info.persistentId
+                val base = info.baseIntent
+                if (id == linkTask && base.component?.className == FrontEndActivity::class.java.name &&
+                    com.droiddeck.launcher.frontend.GameLaunchIntent.accepts(base.action)) task.finishAndRemoveTask()
+            }
+        }
     }
 
     private fun completeLeave() {
@@ -3583,6 +3601,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     companion object {
         const val EXTRA_RETURN_HOME = "returnHome"
+        const val EXTRA_LINK_TASK = "linkTask"
         const val EXTRA_STEAMVR = "steamVr"
         const val EXTRA_REPAIR_RUNTIME = "repairRuntime"
         private const val LEAVE_TIMEOUT_MS = 1_500L

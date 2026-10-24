@@ -9,6 +9,16 @@ DroidDeck brings the SteamOS experience to Android: Valve's Steam client in Big 
 
 <p align="center"><a href="https://discord.gg/JRGAvawjsm"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Join the DroidDeck Discord"></a></p>
 
+<p align="center">
+  <a href="https://trendshift.io/repositories/267852?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-267852" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/267852/daily?language=C" alt="Droid-Deck%2FDroidDeck | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/267852?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-267852" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/267852/daily?language=Kotlin" alt="Droid-Deck%2FDroidDeck | Trendshift" width="250" height="55"/></a>
+</p>
+
+<p align="center">
+  <a href="https://trendshift.io/repositories/267852?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-267852" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/267852/weekly?language=C" alt="Droid-Deck%2FDroidDeck | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/267852?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-267852" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/267852/weekly?language=Kotlin" alt="Droid-Deck%2FDroidDeck | Trendshift" width="250" height="55"/></a>
+</p>
+
 <p align="center"><img src="docs/releases/media/0.2.0/launch-into-steam.gif" width="80%" alt="Tapping DroidDeck on the Android home screen and landing in Steam Big Picture"></p>
 
 > Note: DroidDeck does not have a stand-alone website. Do not click on any download links from websites claiming to be the DroidDeck team. 

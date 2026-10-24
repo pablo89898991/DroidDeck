@@ -545,12 +545,12 @@ class FrontEndActivity : ComponentActivity() {
             }
             startActivity(Intent(this, SessionActivity::class.java).setAction(SessionService.ACTION_RESUME)
                 .putExtra(SessionActivity.EXTRA_STEAMVR, steamVr)
-                .putExtra(SessionActivity.EXTRA_RETURN_HOME, returnHome)
+                .returnTo(returnHome)
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
             return true
         }
         return startSession(Intent(this, SessionActivity::class.java)
-                .putExtra(SessionActivity.EXTRA_RETURN_HOME, returnHome)
+                .returnTo(returnHome)
                 .apply {
                     if (game.gameIdString == com.droiddeck.launcher.gpu.SteamVr.APP_ID) {
                         putExtra(SessionActivity.EXTRA_STEAMVR, true)
@@ -559,6 +559,12 @@ class FrontEndActivity : ComponentActivity() {
                             com.droiddeck.launcher.frontend.GameLaunchLink.steamUrl(game.gameIdString))
                     }
                 }, steamSession = true)
+    }
+
+    private fun Intent.returnTo(returnHome: Boolean): Intent {
+        val task = taskId
+        return putExtra(SessionActivity.EXTRA_RETURN_HOME, returnHome)
+            .apply { if (returnHome) putExtra(SessionActivity.EXTRA_LINK_TASK, task) }
     }
 
     private fun launchWithoutSteam(game: Library.SteamGame, returnHome: Boolean): Boolean {
@@ -574,7 +580,7 @@ class FrontEndActivity : ComponentActivity() {
                 }
                 com.droiddeck.launcher.session.NoSteamLaunch.remember(command)
                 val next = Intent(this, SessionActivity::class.java)
-                    .putExtra(SessionActivity.EXTRA_RETURN_HOME, returnHome)
+                    .returnTo(returnHome)
                     .putExtra(SessionService.EXTRA_MODE, SessionService.MODE_RUN)
                     .putExtra(SessionService.EXTRA_PROGRAM, command.program)
                     .putExtra(SessionService.EXTRA_PROGRAM_ARGS, command.args.toTypedArray())
@@ -583,7 +589,7 @@ class FrontEndActivity : ComponentActivity() {
                     SessionState.stopRequested -> android.widget.Toast.makeText(this, R.string.game_link_session_busy, android.widget.Toast.LENGTH_LONG).show()
                     SessionState.mode == SessionService.MODE_RUN && SessionState.program == command.program && SessionState.programArgs == command.args ->
                         startActivity(Intent(this, SessionActivity::class.java).setAction(SessionService.ACTION_RESUME)
-                            .putExtra(SessionActivity.EXTRA_RETURN_HOME, returnHome)
+                            .returnTo(returnHome)
                             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
                     else -> pendingSwitch = next
                 }

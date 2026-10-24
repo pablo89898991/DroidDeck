@@ -71,6 +71,7 @@ class SessionService : Service() {
     private val steamDownloadMonitor = SteamDownloadMonitor()
     private var downloadMonitorTask: Runnable? = null
     private var downloadActive = false
+    private var clientInstallActive = false
     @Volatile private var steamLibraryMounts = emptyMap<String, File>()
     private var suspendDownloadNow = false
     private var suspendPolicy = SessionPrefs.SUSPEND_MANUAL
@@ -321,6 +322,7 @@ class SessionService : Service() {
         suspendDownloadNow = false
         steamDownloadMonitor.reset()
         downloadActive = false
+        clientInstallActive = false
         steamSleepToken = null
         completeNativeSleep()
         suspendOperationPending = false
@@ -640,8 +642,8 @@ class SessionService : Service() {
                     }
                 },
             )
-            mainHandler.post { updateSuspendPolicy() }
             updateDownloadMonitoring()
+            mainHandler.post { updateSuspendPolicy() }
         }
     }
 
@@ -1415,8 +1417,7 @@ class SessionService : Service() {
     private fun updateSuspendPolicy() {
         if (!SessionState.running) return
         val hidden = !hasVisibleSurface
-        val downloadsBlockingSuspend = steamDownloadsInBackground && SessionState.mode == MODE_STEAM &&
-            suspendPolicy != SessionPrefs.SUSPEND_NEVER && hidden && downloadActive && !suspendDownloadNow
+        val downloadsBlockingSuspend = downloadsKeepAwake() && hidden && !suspendDownloadNow
         if (suspendPolicy == SessionPrefs.SUSPEND_MANUAL && hidden && !downloadsBlockingSuspend) {
             manualPauseRequested = true
         } else if (!hidden && !SessionState.suspended) {
@@ -1832,8 +1833,7 @@ class SessionService : Service() {
             .setContentText(getString(
                 when {
                     SessionState.suspended -> R.string.session_notification_paused
-                    downloadActive && steamDownloadsInBackground &&
-                        suspendPolicy != SessionPrefs.SUSPEND_NEVER -> R.string.session_notification_downloads
+                    downloadsKeepAwake() -> R.string.session_notification_downloads
                     else -> R.string.session_notification
                 }
             ))
@@ -1841,8 +1841,7 @@ class SessionService : Service() {
             .apply {
                 if (SessionState.suspended) {
                     addAction(Notification.Action.Builder(null, getString(R.string.resume_session), resume).build())
-                } else if (downloadActive && steamDownloadsInBackground &&
-                    suspendPolicy != SessionPrefs.SUSPEND_NEVER) {
+                } else if (downloadsKeepAwake()) {
                     val suspend = PendingIntent.getService(
                         this@SessionService, 3,
                         Intent(this@SessionService, SessionService::class.java).setAction(ACTION_SUSPEND_NOW),
@@ -1862,33 +1861,50 @@ class SessionService : Service() {
         getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, buildNotification())
     }
 
+    private fun downloadsKeepAwake(): Boolean =
+        downloadActive && (steamDownloadsInBackground || clientInstallActive) &&
+            SessionState.mode == MODE_STEAM && suspendPolicy != SessionPrefs.SUSPEND_NEVER
+
+    private fun downloadWatchWanted(): Boolean =
+        SessionState.running && SessionState.mode == MODE_STEAM && suspendPolicy != SessionPrefs.SUSPEND_NEVER &&
+            (steamDownloadsInBackground || !SessionState.firstFrameSeen)
+
     private fun updateDownloadMonitoring() {
-        val enabled = SessionState.running && SessionState.mode == MODE_STEAM &&
-            steamDownloadsInBackground && suspendPolicy != SessionPrefs.SUSPEND_NEVER
-        if (!enabled) {
+        if (!downloadWatchWanted()) {
             val wasActive = downloadActive
             downloadMonitorTask?.let(mainHandler::removeCallbacks)
             downloadMonitorTask = null
             steamDownloadMonitor.reset()
             downloadActive = false
+            if (clientInstallActive) SessionEvents.record("steam.client_download", mapOf("active" to false))
+            clientInstallActive = false
             if (wasActive) refreshNotification()
             return
         }
         if (downloadMonitorTask != null) return
         val poll = object : Runnable {
             override fun run() {
-                if (downloadMonitorTask !== this || !SessionState.running ||
-                    SessionState.mode != MODE_STEAM || !steamDownloadsInBackground ||
-                    suspendPolicy == SessionPrefs.SUSPEND_NEVER) {
+                if (downloadMonitorTask !== this) return
+                if (!downloadWatchWanted()) {
+                    downloadMonitorTask = null
+                    updateDownloadMonitoring()
+                    updateSuspendPolicy()
                     return
                 }
+                val root = LinuxRuntime.rootDir(this@SessionService)
                 val wasActive = downloadActive
-                downloadActive = steamDownloadMonitor.poll(
-                    LinuxRuntime.rootDir(this@SessionService),
+                val wasInstalling = clientInstallActive
+                clientInstallActive = !SessionState.firstFrameSeen &&
+                    (clientInstallActive || SteamDownloadMonitor.clientInstallPending(root))
+                downloadActive = clientInstallActive || steamDownloadsInBackground && steamDownloadMonitor.poll(
+                    root,
                     receivedBytes = TrafficStats.getUidRxBytes(android.os.Process.myUid()),
                     client = SessionState.steamClientArch,
                     mounts = steamLibraryMounts,
                 )
+                if (wasInstalling != clientInstallActive) {
+                    SessionEvents.record("steam.client_download", mapOf("active" to clientInstallActive))
+                }
                 if (wasActive != downloadActive) refreshNotification()
                 updateSuspendPolicy()
                 mainHandler.postDelayed(this, DOWNLOAD_POLL_MS)
