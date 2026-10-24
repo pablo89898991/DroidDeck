@@ -1104,6 +1104,27 @@ static bool first(std::atomic<uint32_t> &n, uint32_t count) {
   return i < count || i % 100 == 0;
 }
 
+/** Which X server this is (Xwayland ":0" / ":1" from its command line), or "" in other processes. */
+static const char *display() {
+  static char name[16] = {0};
+  static std::once_flag once;
+  std::call_once(once, [] {
+    char args[4096];
+    int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline", O_RDONLY | O_CLOEXEC));
+    if (fd < 0) return;
+    ssize_t n = syscall(SYS_read, fd, args, sizeof(args) - 1);
+    syscall(SYS_close, fd);
+    if (n <= 0) return;
+    args[n] = 0;
+    for (ssize_t i = 0; i < n; i += static_cast<ssize_t>(strlen(args + i)) + 1)
+      if (args[i] == ':' && args[i + 1] >= '0' && args[i + 1] <= '9') {
+        snprintf(name, sizeof(name), " %s", args + i);
+        break;
+      }
+  });
+  return name;
+}
+
 static void log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void log(const char *fmt, ...) {
   config();
@@ -1112,7 +1133,16 @@ static void log(const char *fmt, ...) {
   va_start(args, fmt);
   vsnprintf(text, sizeof(text), fmt, args);
   va_end(args);
-  Logger::log("mouse: %s\n", text);
+  Logger::log("mouse:%s %s\n", display(), text);
+}
+
+/** Each libei / libeis event type once per process (the connection's life: added, resumed, paused, ...). */
+static void event_type_once(const char *side, uint32_t type) {
+  static std::atomic<uint64_t> seen[4];
+  uint32_t slot = type % 256;
+  uint64_t bit = 1ULL << (slot % 64);
+  if (seen[slot / 64].fetch_or(bit) & bit) return;
+  log("%s event type %u", side, type);
 }
 
 template <typename Fn> static Fn real(const char *name, const char *library) {
@@ -1165,6 +1195,29 @@ EXPORT void ei_device_start_emulating(void *device, uint32_t sequence) {
   if (real) real(device, sequence);
 }
 
+EXPORT int ei_setup_backend_socket(void *ei, const char *socketpath) {
+  static auto real = input_trace::real<int (*)(void *, const char *)>("ei_setup_backend_socket", "libei.so.1");
+  int result = real ? real(ei, socketpath) : -ENOSYS;
+  input_trace::log("X server connects to gamescope's input socket %s: %s", socketpath ? socketpath : "(LIBEI_SOCKET)",
+                   result == 0 ? "ok" : strerror(result < 0 ? -result : result));
+  return result;
+}
+
+EXPORT void ei_device_pointer_motion(void *device, double x, double y) {
+  static auto real = input_trace::real<void (*)(void *, double, double)>("ei_device_pointer_motion", "libei.so.1");
+  static std::atomic<uint32_t> n{0};
+  uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
+  if (i < 3 || i % 500 == 0) input_trace::log("X server handed mouse motion #%u to gamescope (libei)", i + 1);
+  if (real) real(device, x, y);
+}
+
+EXPORT uint32_t ei_event_get_type(void *event) {
+  static auto real = input_trace::real<uint32_t (*)(void *)>("ei_event_get_type", "libei.so.1");
+  uint32_t type = real ? real(event) : 0;
+  input_trace::event_type_once("X server: libei", type);
+  return type;
+}
+
 // step 3 (gamescope): received over libeis, then delivered to the window that has the pointer
 EXPORT uint32_t eis_event_button_get_button(void *event) {
   static auto real = input_trace::real<uint32_t (*)(void *)>("eis_event_button_get_button", "libeis.so.1");
@@ -1183,6 +1236,20 @@ EXPORT uint32_t eis_event_keyboard_get_key(void *event) {
   if (input_trace::first(input_trace::keys, 6))
     input_trace::log("gamescope received key %u %s (libeis)", key, pressed && pressed(event) ? "press" : "release");
   return key;
+}
+
+EXPORT void eis_client_connect(void *client) {
+  static auto real = input_trace::real<void (*)(void *)>("eis_client_connect", "libeis.so.1");
+  static std::atomic<uint32_t> n{0};
+  input_trace::log("gamescope: X server #%u connected for input (libeis client %p)", n.fetch_add(1) + 1, client);
+  if (real) real(client);
+}
+
+EXPORT uint32_t eis_event_get_type(void *event) {
+  static auto real = input_trace::real<uint32_t (*)(void *)>("eis_event_get_type", "libeis.so.1");
+  uint32_t type = real ? real(event) : 0;
+  input_trace::event_type_once("gamescope: libeis", type);
+  return type;
 }
 
 EXPORT void eis_device_configure_capability(void *device, uint32_t capability) {
