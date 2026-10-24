@@ -50,7 +50,8 @@ struct HookupSlot {
   int32_t get_length;
   uint8_t get[HOOKUP_REPORT_MAX];
   uint64_t direct_ms;  // SDL3 bridge heartbeat (CLOCK_MONOTONIC ms) while it writes this slot itself (fast path)
-  uint8_t reserved[1024 - 528];
+  uint32_t rate_hz;    // the bridge's Poll rate: hand Steam at most this many reports a second (0 = every one)
+  uint8_t reserved[1024 - 532];
   uint8_t desc[HOOKUP_DESC_MAX];
   HookupReport in[HOOKUP_IN_FIFO];
   HookupReport out[HOOKUP_OUT_FIFO];
@@ -78,6 +79,7 @@ static_assert(offsetof(HookupSlot, in_write) == 344, "hookup in_write offset");
 static_assert(offsetof(HookupSlot, get_report_id) == 384, "hookup get_report_id offset");
 static_assert(offsetof(HookupSlot, get) == 392, "hookup get offset");
 static_assert(offsetof(HookupSlot, direct_ms) == 520, "hookup direct_ms offset");
+static_assert(offsetof(HookupSlot, rate_hz) == 528, "hookup rate_hz offset");
 static_assert(offsetof(HookupSlot, desc) == 1024, "hookup desc offset");
 static_assert(offsetof(HookupSlot, in) == 5120, "hookup in offset");
 static_assert(offsetof(HookupSlot, out) == 41984, "hookup out offset");
@@ -207,6 +209,18 @@ static std::atomic<int> g_hookup_samples{0};
 /** Steam process, as Steam writes its virtual pad: the end of step 2. */
 __attribute__((visibility("hidden"))) static void hookup_meter_virtual_pad(const std::vector<struct input_event> &events) {
   hookup_boost_this_thread("writes Steam's virtual controller");
+  {  // how often Steam updates its virtual pad: every update is passed on to the game, one by one
+    static std::atomic<uint32_t> updates{0}, logged{0};
+    static std::atomic<uint64_t> since{0};
+    uint64_t t = monotonic_us(), was = since.load(std::memory_order_relaxed);
+    if (!was) since.compare_exchange_strong(was, t);
+    if (!events.empty()) updates.fetch_add(1, std::memory_order_relaxed);
+    if (was && t - was >= 10000000ULL && since.compare_exchange_strong(was, t)) {
+      uint32_t n = updates.exchange(0);
+      if (n && (logged.fetch_add(1) < 3 || n > 4000))
+        Logger::log("latency: Steam updates its virtual pad %.0f times a second\n", n / ((t - was) / 1e6));
+    }
+  }
   uint64_t press = g_hookup_press_us.load(std::memory_order_acquire);
   if (!press) return;
   static HookupLatency stat;
@@ -464,6 +478,11 @@ struct HookupQueue {
   bool closed = false;         // the report thread ended (controller gone)
   bool drains = false;         // learned: Steam takes everything waiting each time
   uint64_t last_read_us = 0;   // Steam's last read that got a report
+  // Paced (Hook-up, the bridge's Poll rate): Steam is told "something to read" at most once per interval and then
+  // gets the newest report (short presses still reach it in order) -- like DroidDeck's own pads, which make
+  // reports at their own rate.
+  uint32_t interval_us = 0;
+  uint64_t last_token_us = 0;
   uint64_t peer_check_us = 0;
   uint32_t mode_logs = 0;
   char name[64] = {};
@@ -556,11 +575,15 @@ __attribute__((visibility("hidden"))) static int hookup_offer(HookupQueue &q, in
     }
     hookup_remove(q, drop);
   }
-  if (!q.token) {  // tell Steam's poll() there is something to read
+  if (!q.token && (!q.interval_us || now - q.last_token_us >= q.interval_us)) {  // tell Steam's poll() there is something
     uint8_t token = 1;
-    if (send(peer, &token, 1, MSG_DONTWAIT | MSG_NOSIGNAL) == 1) q.token = true;
-    else if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;  // Steam closed the node
-  } else if (now - q.peer_check_us > 100000) {  // the token is waiting: did Steam close the node meanwhile?
+    if (send(peer, &token, 1, MSG_DONTWAIT | MSG_NOSIGNAL) == 1) {
+      q.token = true;
+      q.last_token_us = now;
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      return -1;  // Steam closed the node
+    }
+  } else if (q.token && now - q.peer_check_us > 100000) {  // the token is waiting: did Steam close the node meanwhile?
     q.peer_check_us = now;
     struct pollfd p = {peer, 0, 0};
     struct timespec zero = {0, 0};
@@ -574,15 +597,37 @@ __attribute__((visibility("hidden"))) static int hookup_offer(HookupQueue &q, in
       if (!q.told_unread)
         Logger::log("%s: Steam keeps this copy of the node open without reading it (it only sends it settings)\n", q.name);
       q.told_unread = true;
-    } else if (q.skipped || q.lost || (q.handed && q.wait_sum_us / q.handed > 2000))
+    } else if ((q.skipped && !q.interval_us) || q.lost ||
+               (q.handed && q.wait_sum_us / q.handed > 2000 + q.interval_us))
       Logger::log("%s: %.0f reports/s, Steam read %.0f/s (%s), avg %.1f ms after they arrived (max %.1f ms); %u older "
-                  "ones skipped while Steam was busy%s\n",
-                  q.name, q.arrived / secs, q.handed / secs, q.drains ? "all waiting each time" : "the newest each time",
+                  "ones skipped%s%s\n",
+                  q.name, q.arrived / secs, q.handed / secs,
+                  q.interval_us ? "paced: the newest" : q.drains ? "all waiting each time" : "the newest each time",
                   q.handed ? q.wait_sum_us / 1000.0 / q.handed : 0.0, q.wait_max_us / 1000.0, q.skipped,
+                  q.interval_us ? "" : " while Steam was busy",
                   q.lost ? " -- Steam stopped reading for a while, some short presses were dropped" : "");
     q.arrived = q.handed = q.skipped = q.lost = 0;
     q.wait_sum_us = q.wait_max_us = 0;
     q.meter_us = now;
+  }
+  return 0;
+}
+
+/**
+ * Paced mailbox: the "something to read" token held back by hookup_offer (interval not over yet) goes out once the
+ * interval is over. Returns how many microseconds until then (0 = nothing waiting). -1 = Steam closed the node.
+ */
+__attribute__((visibility("hidden"))) static int64_t hookup_token_due(HookupQueue &q, int peer, uint64_t now) {
+  std::lock_guard<std::mutex> guard(q.lock);
+  if (q.token || !q.n || !q.interval_us) return 0;
+  uint64_t since = now - q.last_token_us;
+  if (since < q.interval_us) return static_cast<int64_t>(q.interval_us - since);
+  uint8_t token = 1;
+  if (send(peer, &token, 1, MSG_DONTWAIT | MSG_NOSIGNAL) == 1) {
+    q.token = true;
+    q.last_token_us = now;
+  } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    return -1;
   }
   return 0;
 }
@@ -616,7 +661,7 @@ __attribute__((visibility("hidden"))) static ssize_t hookup_read_steam(int fd, H
       if (q.n) {
         // back after a while, and a report it left waiting last time is still here: it reads one at a time
         if (new_cycle && q.drains && q.entries[0].arrived_us < q.last_read_us) hookup_set_mode(q, false);
-        if (!q.drains)  // the newest, minus what can't be skipped
+        if (!q.drains || q.interval_us)  // the newest, minus what can't be skipped (always when paced)
           for (int i = 0; i < q.n - 1;) {
             if (hookup_skippable(q, i)) {
               hookup_remove(q, i);
@@ -752,6 +797,24 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
       if (hookup_offer(q, self->peer, s, data, length) < 0) peer_gone = true;
     }
     if (peer_gone) break;  // Steam closed the node
+    // the bridge's Poll rate paces what Steam is handed (fast path only; 0 / relayed by DroidDeck's app = every report)
+    {
+      uint64_t beat_ms = __atomic_load_n(&s->direct_ms, __ATOMIC_ACQUIRE);
+      uint32_t hz = beat_ms && monotonic_us() / 1000 - beat_ms < 1500 ? __atomic_load_n(&s->rate_hz, __ATOMIC_ACQUIRE) : 0;
+      uint32_t interval = hz >= 20 && hz < 1000 ? 1000000u / hz : 0;  // 1000 Hz and up: every report, as before
+      std::lock_guard<std::mutex> guard(q.lock);
+      if (interval != q.interval_us) {
+        if (interval)
+          Logger::log("hookup: /dev/hidraw%u: Steam gets the newest report %u times a second (the bridge's Poll rate)\n",
+                      HOOKUP_MINOR_BASE + self->hookup, hz);
+        else
+          Logger::log("hookup: /dev/hidraw%u: every report goes to Steam (Poll rate 1000 Hz)\n",
+                      HOOKUP_MINOR_BASE + self->hookup);
+        q.interval_us = interval;
+      }
+    }
+    int64_t due = hookup_token_due(q, self->peer, monotonic_us());
+    if (due < 0) break;  // Steam closed the node
     uint64_t hop_now = monotonic_us();
     if (hop_now - hop_since >= 10000000ULL) {  // first one always, then when the hop is slow
       if (hop_n && (hop_logs++ == 0 || hop_sum / hop_n > 1000 || hop_max > 8000))
@@ -766,7 +829,9 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
     // low half of in_write changes); reports relayed by DroidDeck's app are picked up by the timeout.
     uint64_t beat = __atomic_load_n(&s->direct_ms, __ATOMIC_ACQUIRE);
     bool fast = beat && monotonic_us() / 1000 - beat < 1500;
-    struct timespec wait = {0, (fast ? 4000L : 500L) * 1000L};
+    long wait_us = fast ? 4000L : 500L;
+    if (due > 0 && due < wait_us) wait_us = static_cast<long>(due);  // a held-back token is due sooner
+    struct timespec wait = {0, wait_us * 1000L};
     syscall(SYS_futex, reinterpret_cast<uint32_t *>(&s->in_write), HOOKUP_FUTEX_WAIT, static_cast<uint32_t>(written),
             &wait, nullptr, 0);
   }

@@ -233,7 +233,7 @@ internal fun SdlBridgeSettingsTab(host: MenuHost, track: (String) -> Modifier = 
             SdlBridgeLink.set("forceUsb", bool = it)
         }
         val rateMs = ints("rateMs")
-        BridgeChoiceRow(host, "sdl3-rate", "Poll rate", "Higher = lower gyro and trackpad latency, a little more battery.",
+        BridgeChoiceRow(host, "sdl3-rate", "Poll rate", "Higher = lower gyro and trackpad latency, a little more battery. In Steam Native Hook-up it is also how often Steam gets the newest report (lower if games lag).",
             names("rateNames").mapIndexed { i, n -> rateMs.getOrElse(i) { 2 } to n }, s.getInt("pollMs"), chipModifier = track("sdl3-rate")) {
             SdlBridgeLink.set("pollMs", int = it)
         }
