@@ -198,6 +198,7 @@ object DualSenseBridge {
             server = Messenger(b)
             send(Message.obtain(null, MSG_REGISTER).apply { replyTo = inbox })
             sendShm()
+            workerHandler.post { if (onDesktop()) sendSync() }   // the desktop: say at once whether Steam runs
         }
         override fun onServiceDisconnected(n: ComponentName) {
             server = null; release()
@@ -260,6 +261,7 @@ object DualSenseBridge {
         }
         HookupBridge.note("bridge: disconnected (session ended)")
         sessionActive = false
+        steamAwayNoted = null
         workerHandler.removeCallbacks(watchdog)
         owner = null
         if (bound) {
@@ -343,7 +345,7 @@ object DualSenseBridge {
                 if (bound) HookupBridge.note("bridge: watchdog (re)connecting to the SDL3 bridge")
             } else if (server != null) {
                 serverLostTicks = 0
-                send(Message.obtain(null, MSG_HOOKUP_SYNC).apply { replyTo = inbox })
+                sendSync()
             } else if (bound && ++serverLostTicks >= 4) {
                 // bound but no connection for ~6 s (the bridge app was force-stopped): start over
                 serverLostTicks = 0
@@ -354,6 +356,36 @@ object DualSenseBridge {
             updateHookupPad()
             workerHandler.postDelayed(this, WATCHDOG_MS)
         }
+    }
+
+    // ---------------- DroidDeck's desktop: Steam Native Hook-up waits for Steam ----------------
+    // On the desktop Steam is one program among others, and it may not be running. The bridge then hands controllers
+    // to Steam only while the Steam client runs (its heartbeat in the hook-up file); until it starts -- and after it
+    // quits -- they stay ordinary gamepads every program can use. In the Steam session Steam always runs.
+    @Volatile private var steamAwayNoted: Boolean? = null
+
+    private fun onDesktop(): Boolean = try {
+        com.droiddeck.launcher.session.SessionState.mode == com.droiddeck.launcher.session.SessionService.MODE_DESKTOP
+    } catch (_: Throwable) { false }
+
+    private fun desktopWithoutSteam(): Boolean {
+        val desktop = onDesktop()
+        val away = desktop && !HookupBridge.steamRunning()
+        if (desktop && away != steamAwayNoted) {
+            steamAwayNoted = away
+            HookupBridge.note(if (away) "hookup: Steam is not running on the desktop: with Steam Native Hook-up on, the SDL3 " +
+                "bridge keeps controllers as ordinary gamepads until Steam starts"
+            else "hookup: Steam runs on the desktop: with Steam Native Hook-up on, the SDL3 bridge hands controllers to Steam")
+        }
+        return away
+    }
+
+    /** "Send me everything you hand over right now" -- and, on the desktop, whether Steam is there to take it. */
+    private fun sendSync() {
+        send(Message.obtain(null, MSG_HOOKUP_SYNC).apply {
+            replyTo = inbox
+            data = Bundle().apply { putBoolean("steamAway", desktopWithoutSteam()) }
+        })
     }
 
     // ---------------- Steam Native Hook-up: Steam -> controller ----------------

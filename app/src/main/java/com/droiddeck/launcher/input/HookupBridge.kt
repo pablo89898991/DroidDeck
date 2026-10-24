@@ -40,6 +40,8 @@ object HookupBridge {
 
     // header
     private const val H_FF_TO_STEAM = 8
+    private const val H_STEAM_MS = 16    // the Steam client's heartbeat (CLOCK_MONOTONIC ms), written by fakeinput
+    private const val STEAM_GONE_MS = 5000L
     // slot
     private const val S_PRESENT = 0
     private const val S_GENERATION = 4
@@ -125,6 +127,16 @@ object HookupBridge {
     private fun bridgeServes(m: ByteBuffer, slot: Int): Boolean {
         val beat = m.getLong(slotBase(slot) + S_DIRECT_MS)
         return beat != 0L && android.os.SystemClock.uptimeMillis() - beat < 1500
+    }
+
+    /**
+     * Is the Steam client running in this session? Its side of the hook-up writes a heartbeat into the shared file
+     * every 0.1 s. (No hook-up file this session: treated as running, so nothing waits for it.)
+     */
+    @JvmStatic fun steamRunning(): Boolean {
+        val m = map ?: return true
+        val beat = m.getLong(H_STEAM_MS)
+        return beat != 0L && android.os.SystemClock.uptimeMillis() - beat < STEAM_GONE_MS
     }
 
     @JvmStatic fun anyPresent(): Boolean = present.any { it }

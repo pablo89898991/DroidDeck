@@ -1448,6 +1448,88 @@ __attribute__((visibility("hidden"))) static bool is_triton_hidraw_path(const ch
   return pathname && fake_triton_enabled() && !strcmp(pathname, TRITON_HIDRAW_PATH) && triton_connected();
 }
 
+// ===================== sdl3bridge: DroidDeck's desktop session =====================
+// On the desktop (FAKE_EVDEV_DESKTOP=1: the deck pad is on there for the SDL3 bridge) Steam is one program among
+// others, like on a PC:
+//  - the Steam client gets the bridge's controller as its own node (the "present as" type, or the real controller
+//    with Steam Native Hook-up), so DroidDeck's first pad (the same controller) is not shown to it; the other pads
+//    are, as in the Steam session;
+//  - games Steam starts get Steam's virtual pads, as in the Steam session (none of DroidDeck's own pads);
+//  - every other program keeps DroidDeck's pads (Xbox 360 controllers) and does not see the hidraw nodes meant for
+//    Steam, so no controller shows up twice.
+__attribute__((visibility("hidden"))) static bool desktop_session() {
+  static int on = -1;
+  if (on < 0) on = getenv("FAKE_EVDEV_DESKTOP") && atoi(getenv("FAKE_EVDEV_DESKTOP")) ? 1 : 0;
+  return on == 1;
+}
+
+__attribute__((visibility("hidden"))) static bool desktop_word_is_steam(const char *word, size_t length) {
+  const char *name = word;
+  for (size_t i = 0; i < length && word[i]; i++)
+    if (word[i] == '/') name = word + i + 1;
+  return name + 5 == word + length && !strncmp(name, "steam", 5);
+}
+
+/** Is process [pid] the Steam client? Its name, or -- FEX running the x86-64 client -- the program it runs. */
+__attribute__((visibility("hidden"))) static bool desktop_pid_is_steam(pid_t pid, pid_t *parent) {
+  char path[64], buf[1024];
+  *parent = 0;
+  snprintf(path, sizeof(path), "/proc/%d/stat", static_cast<int>(pid));
+  int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC));
+  if (fd < 0) return false;
+  ssize_t n = syscall(SYS_read, fd, buf, sizeof(buf) - 1);
+  syscall(SYS_close, fd);
+  if (n <= 0) return false;
+  buf[n] = 0;
+  char *open_paren = strchr(buf, '('), *close_paren = strrchr(buf, ')');
+  if (!open_paren || !close_paren || close_paren < open_paren) return false;
+  int ppid = 0;
+  if (sscanf(close_paren + 1, " %*c %d", &ppid) == 1) *parent = static_cast<pid_t>(ppid);
+  if (desktop_word_is_steam(open_paren + 1, static_cast<size_t>(close_paren - open_paren - 1))) return true;
+  snprintf(path, sizeof(path), "/proc/%d/cmdline", static_cast<int>(pid));
+  fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC));
+  if (fd < 0) return false;
+  n = syscall(SYS_read, fd, buf, sizeof(buf) - 1);
+  syscall(SYS_close, fd);
+  if (n <= 0) return false;
+  buf[n] = 0;
+  const char *word = buf, *end = buf + n;
+  for (int i = 0; i < 2 && word < end; i++) {   // argv[0], and argv[1] for FEX ("FEX /.../steamrt64/steam")
+    size_t length = strnlen(word, static_cast<size_t>(end - word));
+    if (desktop_word_is_steam(word, length)) return true;
+    word += length + 1;
+  }
+  return false;
+}
+
+/** Started by the Steam client (a game, or anything it runs): looked up once, through the parent processes. */
+__attribute__((visibility("hidden"))) static bool started_by_steam() {
+  static int known = 0;
+  if (known) return known > 0;
+  bool found = false;
+  pid_t pid = getppid();
+  for (int depth = 0; pid > 1 && depth < 64 && !found; depth++) {
+    pid_t parent = 0;
+    found = desktop_pid_is_steam(pid, &parent);
+    pid = parent;
+  }
+  known = found ? 1 : -1;
+  return found;
+}
+
+/** A program started on the desktop: neither the Steam client nor something Steam started. */
+__attribute__((visibility("hidden"))) static bool desktop_program() {
+  return desktop_session() && !process_is_steam_client() && !started_by_steam();
+}
+
+/** /dev/hidraw16..27 (DroidDeck's nodes for Steam) are not there for a desktop program. */
+__attribute__((visibility("hidden"))) static bool desktop_hidden_hidraw(const char *pathname) {
+  if (!pathname || strncmp(pathname, "/dev/hidraw", 11) || !desktop_session()) return false;
+  char *end = nullptr;
+  long minor = strtol(pathname + 11, &end, 10);
+  return end != pathname + 11 && !*end && minor >= 16 && minor <= 27 && desktop_program();
+}
+
 __attribute__((visibility("hidden"))) static bool is_withdrawn_pad_path(const char *pathname) {
   if (!fake_deck_enabled() || !pathname || strncmp(pathname, "/dev/input/", 11)) return false;
   if (live_pad_type() == PAD_TYPE_XBOX) return false;
@@ -1455,6 +1537,7 @@ __attribute__((visibility("hidden"))) static bool is_withdrawn_pad_path(const ch
   if (strncmp(event, "event", 5) && strncmp(event, "js", 2)) return false;
   int number = get_event_number(event);
   if (number < 0 || number >= UINPUT_EVENT_BASE) return false;
+  if (desktop_session()) return process_is_steam_client() ? number == 0 : started_by_steam();  // sdl3bridge
   return number == 0 || !process_is_steam_client();
 }
 
@@ -3076,7 +3159,9 @@ struct HookupHeader {
   uint32_t magic;
   uint32_t version;
   uint32_t ff_to_steam;
-  uint32_t reserved[13];
+  uint32_t reserved0;
+  uint64_t steam_ms;  // the Steam client's heartbeat (CLOCK_MONOTONIC ms): DroidDeck's desktop knows Steam runs
+  uint32_t reserved[10];
   HookupFF ff[HOOKUP_FF_NODES];
 };
 static_assert(sizeof(HookupReport) == 144, "HookupReport layout");
@@ -3093,6 +3178,7 @@ static_assert(offsetof(HookupSlot, desc) == 1024, "hookup desc offset");
 static_assert(offsetof(HookupSlot, in) == 5120, "hookup in offset");
 static_assert(offsetof(HookupSlot, out) == 41984, "hookup out offset");
 static_assert(sizeof(HookupSlot) <= HOOKUP_SLOT_SIZE, "hookup slot size");
+static_assert(offsetof(HookupHeader, steam_ms) == 16, "hookup steam_ms offset");
 static_assert(offsetof(HookupHeader, ff) == 64, "hookup ff offset");
 static_assert(sizeof(HookupFF) == 24, "hookup ff entry");
 static_assert(sizeof(HookupHeader) <= HOOKUP_HEADER_SIZE, "hookup header size");
@@ -4279,6 +4365,10 @@ __attribute__((visibility("hidden"))) static void *hookup_watch_thread(void *) {
   bool seen[HOOKUP_SLOTS] = {};
   char devpath[HOOKUP_SLOTS][160] = {};
   for (unsigned tick = 0;; tick++) {
+    // Steam runs: on DroidDeck's desktop (where Steam is one program among others) the SDL3 bridge hands
+    // controllers to Steam only while this heartbeat is fresh, and they are ordinary gamepads otherwise
+    if (tick % 50 == 0)
+      if (HookupHeader *h = hookup_header()) __atomic_store_n(&h->steam_ms, monotonic_us() / 1000, __ATOMIC_RELEASE);
     sleep_us(2000);
     hookup_ff_to_steam();
     if (tick % 10) continue;
@@ -4696,6 +4786,10 @@ EXPORT int open(const char *pathname, int flags, ...) {
   static auto my_open = reinterpret_cast<int (*)(const char *, int, ...)>(dlsym(RTLD_NEXT, "open"));
 
   if (fake_uinput_enabled() && is_uinput_path(pathname)) return open_uinput(flags);
+  if (desktop_hidden_hidraw(pathname)) {  // sdl3bridge: meant for Steam, not for desktop programs
+    errno = ENOENT;
+    return -1;
+  }
   if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);
   if (int hk = hookup_path_slot(pathname); hk >= 0) return open_hookup_hidraw(flags, hk);
   if (is_sc1_hidraw_path(pathname)) return open_deck_hidraw(flags, 0, true);
@@ -4776,6 +4870,10 @@ EXPORT int openat(int dirfd, const char *pathname, int flags, ...) {
   static auto my_openat = reinterpret_cast<int (*)(int, const char *, int, ...)>(dlsym(RTLD_NEXT, "openat"));
 
   if (fake_uinput_enabled() && is_uinput_path(pathname)) return open_uinput(flags);
+  if (desktop_hidden_hidraw(pathname)) {  // sdl3bridge: meant for Steam, not for desktop programs
+    errno = ENOENT;
+    return -1;
+  }
   if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);
   if (int hk = hookup_path_slot(pathname); hk >= 0) return open_hookup_hidraw(flags, hk);
   if (is_sc1_hidraw_path(pathname)) return open_deck_hidraw(flags, 0, true);

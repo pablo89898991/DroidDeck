@@ -223,7 +223,9 @@ internal fun SdlBridgeSettingsTab(host: MenuHost, track: (String) -> Modifier = 
     // ---------------- global ----------------
     SettingsGroup("Controller mode") {
         BridgeChoiceRow(host, "sdl3-present", "Present controller as",
-            "How Steam sees the controller. Steam Native Hook-up hands USB controllers to Steam as themselves, like on a PC.",
+            "How Steam sees the controller, in the Steam session and on the desktop. Steam Native Hook-up hands USB " +
+                "controllers to Steam as themselves, like on a PC (on the desktop: while Steam runs; other programs " +
+                "there see an Xbox 360 controller).",
             indexed("presentNames"), s.getInt("presentAs"), chipModifier = track("sdl3-present")) { SdlBridgeLink.set("presentAs", int = it) }
         ToggleRow(host, "sdl3-driver", "SDL3 driver",
             "On: SDL3 reads the controller (all its features). Off: the controller goes back to Android and DroidDeck.",
