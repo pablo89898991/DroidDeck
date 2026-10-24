@@ -1692,5 +1692,58 @@ PY
   esac
 fi
 
+# ---------- 28. Steam Input's mouse clicks reach games again (Remote Play touch shim) ----------
+# Upstream's libblsession.so (preloaded into every process) wraps XTestFakeButtonEvent / XTestFakeMotionEvent for
+# Remote Play touch (tools/linuxfs/preload/rptouch.c) and finds the real ones with dlsym(RTLD_NEXT). Steam's
+# client library links libXtst privately, so from a preload there is no "next" one: the lookup returns NULL and
+# every mouse click (and absolute pointer move) Steam sends was dropped -- a button bound to a mouse click did
+# nothing, while keys and relative mouse movement (other XTest calls) still worked. Every controller, every mode.
+# The real functions are now taken from libXtst itself when they are not next in line.
+RPT="$DD/tools/linuxfs/preload/rptouch.c"
+if [ -f "$RPT" ]; then
+  res=$(python3 - "$RPT" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path, encoding='utf-8').read()
+if 'rt_real(' in s:
+    print("SKIP")
+    sys.exit(0)
+helper = '''/* sdl3deck: the real XTest function. Steam's client library links libXtst privately, so from a preload it is
+ * often not "next" (RTLD_NEXT finds nothing and the call would be dropped): then take it from libXtst itself. */
+static void *rt_real(const char *name) {
+    void *fn = dlsym(RTLD_NEXT, name);
+    if (!fn) {
+        void *xtst = dlopen("libXtst.so.6", RTLD_LAZY | RTLD_NOLOAD);
+        if (xtst) fn = dlsym(xtst, name);
+    }
+    return fn;
+}
+
+'''
+edits = [
+    ('int XTestFakeMotionEvent(void *dpy, int screen, int x, int y, unsigned long delay) {\n',
+     helper + 'int XTestFakeMotionEvent(void *dpy, int screen, int x, int y, unsigned long delay) {\n'),
+    ('(int (*)(void *, int, int, int, unsigned long))dlsym(RTLD_NEXT, "XTestFakeMotionEvent");',
+     '(int (*)(void *, int, int, int, unsigned long))rt_real("XTestFakeMotionEvent");'),
+    ('(int (*)(void *, unsigned int, int, unsigned long))dlsym(RTLD_NEXT, "XTestFakeButtonEvent");',
+     '(int (*)(void *, unsigned int, int, unsigned long))rt_real("XTestFakeButtonEvent");'),
+]
+for old, new in edits:
+    if s.count(old) != 1:
+        sys.stderr.write("ANCHOR-MISS rptouch.c :: %r (found %d)\n" % (old[:70], s.count(old)))
+        sys.exit(3)
+for old, new in edits:
+    s = s.replace(old, new)
+open(path, 'w', encoding='utf-8').write(s)
+print("OK")
+PY
+)
+  case "$res" in
+    OK) ok "Steam Input mouse clicks reach games (Remote Play touch shim finds the real XTest)" ;;
+    SKIP) skip "Remote Play touch shim XTest lookup" ;;
+    *) warn "Remote Play touch shim left as upstream (rptouch.c changed, see ANCHOR-MISS above)" ;;
+  esac
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
