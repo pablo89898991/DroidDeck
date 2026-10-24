@@ -67,7 +67,9 @@ struct HookupHeader {
   uint32_t magic;
   uint32_t version;
   uint32_t ff_to_steam;
-  uint32_t reserved[13];
+  uint32_t reserved0;
+  uint64_t steam_ms;  // the Steam client's heartbeat (CLOCK_MONOTONIC ms): DroidDeck's desktop knows Steam runs
+  uint32_t reserved[10];
   HookupFF ff[HOOKUP_FF_NODES];
 };
 static_assert(sizeof(HookupReport) == 144, "HookupReport layout");
@@ -84,6 +86,7 @@ static_assert(offsetof(HookupSlot, desc) == 1024, "hookup desc offset");
 static_assert(offsetof(HookupSlot, in) == 5120, "hookup in offset");
 static_assert(offsetof(HookupSlot, out) == 41984, "hookup out offset");
 static_assert(sizeof(HookupSlot) <= HOOKUP_SLOT_SIZE, "hookup slot size");
+static_assert(offsetof(HookupHeader, steam_ms) == 16, "hookup steam_ms offset");
 static_assert(offsetof(HookupHeader, ff) == 64, "hookup ff offset");
 static_assert(sizeof(HookupFF) == 24, "hookup ff entry");
 static_assert(sizeof(HookupHeader) <= HOOKUP_HEADER_SIZE, "hookup header size");
@@ -1270,6 +1273,10 @@ __attribute__((visibility("hidden"))) static void *hookup_watch_thread(void *) {
   bool seen[HOOKUP_SLOTS] = {};
   char devpath[HOOKUP_SLOTS][160] = {};
   for (unsigned tick = 0;; tick++) {
+    // Steam runs: on DroidDeck's desktop (where Steam is one program among others) the SDL3 bridge hands
+    // controllers to Steam only while this heartbeat is fresh, and they are ordinary gamepads otherwise
+    if (tick % 50 == 0)
+      if (HookupHeader *h = hookup_header()) __atomic_store_n(&h->steam_ms, monotonic_us() / 1000, __ATOMIC_RELEASE);
     sleep_us(2000);
     hookup_ff_to_steam();
     if (tick % 10) continue;

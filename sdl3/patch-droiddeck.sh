@@ -1749,5 +1749,172 @@ PY
   esac
 fi
 
+# ---------- 29. The SDL3 bridge's controller modes on DroidDeck's desktop too ----------
+# Upstream gives Steam its own controller nodes (Deck pad, PlayStation pads, Steam Controllers, ...) only in the
+# Steam session; on the desktop (and with Steam's desktop UI) every controller is a plain Xbox 360 pad, so the
+# bridge's "present as" types and Steam Native Hook-up did nothing there. With the bridge installed the desktop
+# gets them too, set up the way a PC is -- Steam is one program among others there:
+#  - the Steam client gets the bridge's controller as its own node (the present-as type, or the real controller
+#    with hook-up) instead of DroidDeck's first pad, as in the Steam session;
+#  - games Steam starts get Steam's virtual pads, as in the Steam session;
+#  - every other program keeps DroidDeck's pads (Xbox 360 controllers, as before) and doesn't see the nodes meant
+#    for Steam, so no controller shows up twice.
+# Steam Native Hook-up waits for Steam there: the Steam client's heartbeat (in the hook-up file) tells DroidDeck it
+# runs, and only then does the bridge hand controllers over; until then (and after Steam quits) they are ordinary
+# gamepads for every program (DualSenseBridge.kt / HookupBridge.kt / the bridge app).
+CPP="$DD/app/src/main/cpp/fakeinput_steam.cpp"
+SVC="$PKG/session/SessionService.kt"
+if [ -f "$CPP" ] && [ -f "$SVC" ]; then
+  res=$(python3 - "$CPP" "$SVC" <<'PY'
+import sys
+cpp, svc = sys.argv[1], sys.argv[2]
+texts = {p: open(p, encoding='utf-8').read() for p in (cpp, svc)}
+done = {cpp: 'desktop_hidden_hidraw(' in texts[cpp], svc: 'sdl3Desktop' in texts[svc]}
+if all(done.values()):
+    print("SKIP")
+    sys.exit(0)
+block = r"""// ===================== sdl3bridge: DroidDeck's desktop session =====================
+// On the desktop (FAKE_EVDEV_DESKTOP=1: the deck pad is on there for the SDL3 bridge) Steam is one program among
+// others, like on a PC:
+//  - the Steam client gets the bridge's controller as its own node (the "present as" type, or the real controller
+//    with Steam Native Hook-up), so DroidDeck's first pad (the same controller) is not shown to it; the other pads
+//    are, as in the Steam session;
+//  - games Steam starts get Steam's virtual pads, as in the Steam session (none of DroidDeck's own pads);
+//  - every other program keeps DroidDeck's pads (Xbox 360 controllers) and does not see the hidraw nodes meant for
+//    Steam, so no controller shows up twice.
+__attribute__((visibility("hidden"))) static bool desktop_session() {
+  static int on = -1;
+  if (on < 0) on = getenv("FAKE_EVDEV_DESKTOP") && atoi(getenv("FAKE_EVDEV_DESKTOP")) ? 1 : 0;
+  return on == 1;
+}
+
+__attribute__((visibility("hidden"))) static bool desktop_word_is_steam(const char *word, size_t length) {
+  const char *name = word;
+  for (size_t i = 0; i < length && word[i]; i++)
+    if (word[i] == '/') name = word + i + 1;
+  return name + 5 == word + length && !strncmp(name, "steam", 5);
+}
+
+/** Is process [pid] the Steam client? Its name, or -- FEX running the x86-64 client -- the program it runs. */
+__attribute__((visibility("hidden"))) static bool desktop_pid_is_steam(pid_t pid, pid_t *parent) {
+  char path[64], buf[1024];
+  *parent = 0;
+  snprintf(path, sizeof(path), "/proc/%d/stat", static_cast<int>(pid));
+  int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC));
+  if (fd < 0) return false;
+  ssize_t n = syscall(SYS_read, fd, buf, sizeof(buf) - 1);
+  syscall(SYS_close, fd);
+  if (n <= 0) return false;
+  buf[n] = 0;
+  char *open_paren = strchr(buf, '('), *close_paren = strrchr(buf, ')');
+  if (!open_paren || !close_paren || close_paren < open_paren) return false;
+  int ppid = 0;
+  if (sscanf(close_paren + 1, " %*c %d", &ppid) == 1) *parent = static_cast<pid_t>(ppid);
+  if (desktop_word_is_steam(open_paren + 1, static_cast<size_t>(close_paren - open_paren - 1))) return true;
+  snprintf(path, sizeof(path), "/proc/%d/cmdline", static_cast<int>(pid));
+  fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC));
+  if (fd < 0) return false;
+  n = syscall(SYS_read, fd, buf, sizeof(buf) - 1);
+  syscall(SYS_close, fd);
+  if (n <= 0) return false;
+  buf[n] = 0;
+  const char *word = buf, *end = buf + n;
+  for (int i = 0; i < 2 && word < end; i++) {   // argv[0], and argv[1] for FEX ("FEX /.../steamrt64/steam")
+    size_t length = strnlen(word, static_cast<size_t>(end - word));
+    if (desktop_word_is_steam(word, length)) return true;
+    word += length + 1;
+  }
+  return false;
+}
+
+/** Started by the Steam client (a game, or anything it runs): looked up once, through the parent processes. */
+__attribute__((visibility("hidden"))) static bool started_by_steam() {
+  static int known = 0;
+  if (known) return known > 0;
+  bool found = false;
+  pid_t pid = getppid();
+  for (int depth = 0; pid > 1 && depth < 64 && !found; depth++) {
+    pid_t parent = 0;
+    found = desktop_pid_is_steam(pid, &parent);
+    pid = parent;
+  }
+  known = found ? 1 : -1;
+  return found;
+}
+
+/** A program started on the desktop: neither the Steam client nor something Steam started. */
+__attribute__((visibility("hidden"))) static bool desktop_program() {
+  return desktop_session() && !process_is_steam_client() && !started_by_steam();
+}
+
+/** /dev/hidraw16..27 (DroidDeck's nodes for Steam) are not there for a desktop program. */
+__attribute__((visibility("hidden"))) static bool desktop_hidden_hidraw(const char *pathname) {
+  if (!pathname || strncmp(pathname, "/dev/hidraw", 11) || !desktop_session()) return false;
+  char *end = nullptr;
+  long minor = strtol(pathname + 11, &end, 10);
+  return end != pathname + 11 && !*end && minor >= 16 && minor <= 27 && desktop_program();
+}
+
+"""
+edits = {
+    cpp: [
+        ('__attribute__((visibility("hidden"))) static bool is_withdrawn_pad_path(const char *pathname) {\n',
+         block + '__attribute__((visibility("hidden"))) static bool is_withdrawn_pad_path(const char *pathname) {\n', 1),
+        ('  return number == 0 || !process_is_steam_client();\n',
+         '  if (desktop_session()) return process_is_steam_client() ? number == 0 : started_by_steam();  // sdl3bridge\n'
+         '  return number == 0 || !process_is_steam_client();\n', 1),
+        ('  if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);\n',
+         '  if (desktop_hidden_hidraw(pathname)) {  // sdl3bridge: meant for Steam, not for desktop programs\n'
+         '    errno = ENOENT;\n'
+         '    return -1;\n'
+         '  }\n'
+         '  if (is_deck_hidraw_path(pathname)) return open_deck_hidraw(flags);\n', 2),
+    ],
+    svc: [
+        ('        val wantsDeck = uinput && builtinPad && SessionState.mode == MODE_STEAM &&\n'
+         '            SessionState.steamUi != "desktop" &&\n',
+         '        // sdl3bridge: the desktop (and Steam\'s desktop UI) get the deck pad too while the SDL3 bridge is installed,\n'
+         '        // so its "present as" types and Steam Native Hook-up work there like in the Steam session\n'
+         '        val sdl3Desktop = (SessionState.mode == MODE_DESKTOP ||\n'
+         '            (SessionState.mode == MODE_STEAM && SessionState.steamUi == "desktop")) &&\n'
+         '            com.droiddeck.launcher.input.HookupBridge.wanted(this)\n'
+         '        val wantsDeck = uinput && builtinPad && (SessionState.mode == MODE_STEAM &&\n'
+         '            SessionState.steamUi != "desktop" || sdl3Desktop) &&\n', 1),
+        ('        val wantsTouch = wantsDeck && !File(',
+         '        val wantsTouch = wantsDeck && !sdl3Desktop && !File(', 1),
+        ('        SessionState.deckPad = deckBinds.isNotEmpty()\n',
+         '        SessionState.deckPad = deckBinds.isNotEmpty()\n'
+         '        if (sdl3Desktop && SessionState.deckPad) Log.i(TAG, "deck pad: on for the SDL3 bridge on the desktop " +\n'
+         '            "(Steam gets the controller as the bridge presents it; other programs keep Xbox 360 pads)")\n', 1),
+        ('                guest.add("FAKE_EVDEV_DECK=1")\n',
+         '                guest.add("FAKE_EVDEV_DECK=1")\n'
+         '                if (SessionState.mode == MODE_DESKTOP) guest.add("FAKE_EVDEV_DESKTOP=1")  // sdl3bridge\n', 1),
+        ('"run/udev/data"), SessionState.deckPad, !uinput && SessionState.mode == MODE_STEAM)',
+         '"run/udev/data"), SessionState.deckPad && SessionState.mode != MODE_DESKTOP, !uinput && SessionState.mode == MODE_STEAM)', 1),
+    ],
+}
+for path, changes in edits.items():
+    if done[path]:
+        continue
+    for old, new, want in changes:
+        n = texts[path].count(old)
+        if n != want:
+            sys.stderr.write("ANCHOR-MISS %s :: %r (found %d, expected %d)\n" % (path.rsplit('/', 1)[-1], old[:70], n, want))
+            sys.exit(3)
+        texts[path] = texts[path].replace(old, new)
+for path, text in texts.items():
+    open(path, 'w', encoding='utf-8').write(text)
+print("OK")
+PY
+)
+  case "$res" in
+    OK) ok "desktop session: the SDL3 bridge's present-as types and Steam Native Hook-up for Steam there too" ;;
+    SKIP) skip "desktop session controller modes" ;;
+    *) warn "desktop session left as upstream (Steam gets Xbox 360 pads there; see ANCHOR-MISS above)" ;;
+  esac
+else
+  warn "fakeinput_steam.cpp / SessionService.kt not found (desktop session left as upstream)"
+fi
+
 echo
 echo "Done. Review with:  cd \"$DD\" && git diff"
