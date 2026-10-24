@@ -1092,7 +1092,8 @@ __attribute__((constructor)) static void start_hookup_watch() {
 // A Steam binding to a key, mouse movement or a mouse button reaches a game in three steps: Steam sends an XTest
 // event to the game's X server (Xwayland; Steam does send clicks there), Xwayland hands it to gamescope over libei,
 // and gamescope (libeis) delivers it to the game's window. Steps 2 and 3 are logged here, in the Xwayland and
-// gamescope processes (this library is loaded in all of them), plus the input device each side sets up -- so a
+// gamescope processes (this library is loaded in all of them), plus the input device each side sets up, and
+// Steam's own XTest calls (step 1) -- so a
 // click that goes missing shows where. Buttons are logged one by one at first (then every 100th), keys a few times
 // to compare. Every call is passed on unchanged. The real function is looked up in the library itself if it is not
 // next in line (a program that loaded it privately), so a call is never lost here.
@@ -1145,6 +1146,18 @@ static void event_type_once(const char *side, uint32_t type) {
   log("%s event type %u", side, type);
 }
 
+static const char *x_display(void *display) {
+  using Fn = char *(*)(void *);
+  static Fn get = [] {
+    void *fn = dlsym(RTLD_DEFAULT, "XDisplayString");
+    if (!fn)
+      if (void *x11 = dlopen("libX11.so.6", RTLD_LAZY | RTLD_NOLOAD)) fn = dlsym(x11, "XDisplayString");
+    return reinterpret_cast<Fn>(fn);
+  }();
+  const char *name = display && get ? get(display) : nullptr;
+  return name ? name : "?";
+}
+
 template <typename Fn> static Fn real(const char *name, const char *library) {
   void *fn = dlsym(RTLD_NEXT, name);
   if (!fn) {
@@ -1165,6 +1178,38 @@ static const char *caps(uint32_t c) {
 }
 }  // namespace input_trace
 
+// step 1 (Steam): XTest sent to the game's X server. Steam's client library links libXtst privately, so the real
+// function is not "next" from here: it is looked up in libXtst itself (input_trace::real).
+EXPORT int XTestFakeButtonEvent(void *display, unsigned int button, int is_press, unsigned long delay) {
+  static auto real = input_trace::real<int (*)(void *, unsigned int, int, unsigned long)>("XTestFakeButtonEvent", "libXtst.so.6");
+  int result = real ? real(display, button, is_press, delay) : 0;
+  if (input_trace::first(input_trace::buttons, 40))
+    input_trace::log("Steam sent XTest mouse button %u %s to X display %s (%s)", button, is_press ? "press" : "release",
+                     input_trace::x_display(display), result ? "sent" : "NOT sent: no XTest on that display");
+  return result;
+}
+
+EXPORT int XTestFakeKeyEvent(void *display, unsigned int keycode, int is_press, unsigned long delay) {
+  static auto real = input_trace::real<int (*)(void *, unsigned int, int, unsigned long)>("XTestFakeKeyEvent", "libXtst.so.6");
+  int result = real ? real(display, keycode, is_press, delay) : 0;
+  if (input_trace::first(input_trace::keys, 40))
+    input_trace::log("Steam sent XTest key %u %s to X display %s (%s)", keycode, is_press ? "press" : "release",
+                     input_trace::x_display(display), result ? "sent" : "NOT sent: no XTest on that display");
+  return result;
+}
+
+EXPORT int XTestFakeRelativeMotionEvent(void *display, int dx, int dy, unsigned long delay) {
+  static auto real = input_trace::real<int (*)(void *, int, int, unsigned long)>("XTestFakeRelativeMotionEvent", "libXtst.so.6");
+  return real ? real(display, dx, dy, delay) : 0;
+}
+
+EXPORT int XTestFakeMotionEvent(void *display, int screen, int x, int y, unsigned long delay) {
+  static auto real = input_trace::real<int (*)(void *, int, int, int, unsigned long)>("XTestFakeMotionEvent", "libXtst.so.6");
+  static std::atomic<uint32_t> n{0};
+  if (n.fetch_add(1) < 3) input_trace::log("Steam moved the X pointer to %d,%d on X display %s", x, y, input_trace::x_display(display));
+  return real ? real(display, screen, x, y, delay) : 0;
+}
+
 // step 2 (Xwayland): the X server hands XTest input to gamescope over libei
 EXPORT void ei_device_button_button(void *device, uint32_t button, bool is_press) {
   static auto real = input_trace::real<void (*)(void *, uint32_t, bool)>("ei_device_button_button", "libei.so.1");
@@ -1175,7 +1220,7 @@ EXPORT void ei_device_button_button(void *device, uint32_t button, bool is_press
 
 EXPORT void ei_device_keyboard_key(void *device, uint32_t keycode, bool is_press) {
   static auto real = input_trace::real<void (*)(void *, uint32_t, bool)>("ei_device_keyboard_key", "libei.so.1");
-  if (input_trace::first(input_trace::keys, 6))
+  if (input_trace::first(input_trace::keys, 40))
     input_trace::log("X server handed key %u %s to gamescope (libei)", keycode, is_press ? "press" : "release");
   if (real) real(device, keycode, is_press);
 }
@@ -1233,7 +1278,7 @@ EXPORT uint32_t eis_event_keyboard_get_key(void *event) {
   static auto real = input_trace::real<uint32_t (*)(void *)>("eis_event_keyboard_get_key", "libeis.so.1");
   static auto pressed = input_trace::real<bool (*)(void *)>("eis_event_keyboard_get_key_is_press", "libeis.so.1");
   uint32_t key = real ? real(event) : 0;
-  if (input_trace::first(input_trace::keys, 6))
+  if (input_trace::first(input_trace::keys, 40))
     input_trace::log("gamescope received key %u %s (libeis)", key, pressed && pressed(event) ? "press" : "release");
   return key;
 }
