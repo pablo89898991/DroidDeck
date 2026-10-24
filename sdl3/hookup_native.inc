@@ -28,7 +28,7 @@ static constexpr int HOOKUP_FUTEX_WAIT = 0;  // FUTEX_WAIT, shared: the writer i
 struct HookupReport {
   uint64_t seq;
   uint32_t length;
-  uint32_t kind;  // output fifo: 0 output report, 1 feature write
+  uint32_t kind;  // output fifo: 0 output report, 1 feature write; input fifo: SDL3Bridge's read time (us, 0 = none)
   uint8_t data[HOOKUP_REPORT_MAX];
 };
 struct HookupSlot {
@@ -723,6 +723,9 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
   hookup_boost_this_thread("hands controller reports to Steam");
   uint64_t next = s ? __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE) : 0;
   bool peer_gone = false;
+  // the hop before every other meter: SDL3Bridge reading the report from USB -> picked up here (Hook-up only)
+  uint32_t hop_n = 0, hop_logs = 0;
+  uint64_t hop_sum = 0, hop_max = 0, hop_since = monotonic_us();
   while (s && __atomic_load_n(&s->present, __ATOMIC_ACQUIRE) &&
          __atomic_load_n(&s->generation, __ATOMIC_ACQUIRE) == self->hookup_generation) {
     uint64_t written = __atomic_load_n(&s->in_write, __ATOMIC_ACQUIRE);
@@ -733,13 +736,32 @@ __attribute__((visibility("hidden"))) static void *hookup_report_thread(void *ar
       uint32_t length = __atomic_load_n(&r.length, __ATOMIC_RELAXED);
       if (length > HOOKUP_REPORT_MAX) length = HOOKUP_REPORT_MAX;
       memcpy(data, r.data, length);
+      uint32_t stamp = __atomic_load_n(&r.kind, __ATOMIC_RELAXED);
       __atomic_thread_fence(__ATOMIC_ACQUIRE);
       bool intact = __atomic_load_n(&r.seq, __ATOMIC_ACQUIRE) == next + 1;
       next++;
       if (!intact || !length) continue;
+      if (stamp) {  // same clock in both processes (CLOCK_MONOTONIC); 32-bit microseconds, wraps every 71 min
+        uint32_t hop = static_cast<uint32_t>(monotonic_us()) - stamp;
+        if (hop < 1000000u) {
+          hop_n++;
+          hop_sum += hop;
+          if (hop > hop_max) hop_max = hop;
+        }
+      }
       if (hookup_offer(q, self->peer, s, data, length) < 0) peer_gone = true;
     }
     if (peer_gone) break;  // Steam closed the node
+    uint64_t hop_now = monotonic_us();
+    if (hop_now - hop_since >= 10000000ULL) {  // first one always, then when the hop is slow
+      if (hop_n && (hop_logs++ == 0 || hop_sum / hop_n > 1000 || hop_max > 8000))
+        Logger::log("latency: SDL3Bridge read a report -> it reached Steam's side (/dev/hidraw%u): %u reports, avg %.2f "
+                    "ms, max %.1f ms\n", HOOKUP_MINOR_BASE + self->hookup, hop_n, hop_sum / 1000.0 / hop_n,
+                    hop_max / 1000.0);
+      hop_n = 0;
+      hop_sum = hop_max = 0;
+      hop_since = hop_now;
+    }
     // Sleep until the next report. The SDL3 bridge's fast path wakes this futex the moment it writes one (the
     // low half of in_write changes); reports relayed by DroidDeck's app are picked up by the timeout.
     uint64_t beat = __atomic_load_n(&s->direct_ms, __ATOMIC_ACQUIRE);
